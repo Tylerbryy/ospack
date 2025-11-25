@@ -1,0 +1,13 @@
+{
+  "name": "ospack",
+  "owner": {
+    "name": "ospack"
+  },
+  "plugins": [
+    {
+      "name": "ospack",
+      "source": "./plugins/ospack",
+      "description": "Semantic context packer - import resolution + semantic search"
+    }
+  ]
+}

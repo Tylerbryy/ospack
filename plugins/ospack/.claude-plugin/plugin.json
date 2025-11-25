@@ -1,0 +1,9 @@
+{
+  "name": "ospack",
+  "description": "Semantic context packer - combines import resolution with semantic search",
+  "version": "0.1.0",
+  "author": {
+    "name": "ospack"
+  },
+  "repository": "https://github.com/ospack/ospack"
+}

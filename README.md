@@ -29,7 +29,6 @@ ospack pack --focus src/api.py --query "error handling"
 | `ospack search` | Quick semantic search |
 | `ospack index` | Build/rebuild the search index |
 | `ospack info` | Show device and index info |
-| `ospack mcp` | Start MCP server for AI agents |
 
 ## Options
 
@@ -39,6 +38,43 @@ ospack pack --focus src/api.py --query "error handling"
 -m, --max-files N     Max files to include (default: 10)
 -d, --import-depth N  Import traversal depth (default: 2)
 -o, --format FORMAT   Output: xml, compact, or chunks
+```
+
+## Agent Integration
+
+### Claude Code Plugin
+
+```bash
+# Add the ospack marketplace
+/plugin marketplace add ospack/ospack
+
+# Install the plugin
+/plugin install ospack@ospack
+```
+
+The plugin provides:
+- `/pack` - Pack context command
+- `/search` - Semantic search command
+- Auto-invoked skill for codebase exploration
+
+### MCP Server
+
+```bash
+# Start MCP server for AI agents
+ospack mcp
+```
+
+Or add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "ospack": {
+      "command": "ospack",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
 ## How It Works
