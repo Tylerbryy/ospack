@@ -88,6 +88,9 @@ def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
             "end_line": c.end_line,
             "node_type": c.node_type,
             "name": c.name or "",
+            "is_anchor": c.is_anchor,
+            "context_prev": c.context_prev or "",
+            "context_next": c.context_next or "",
             "last_modified": mtime,
         } for c in chunks]
     except Exception:
@@ -358,7 +361,8 @@ class Indexer:
 
         # Only fetch text fields, NOT vectors (huge RAM savings)
         df = self._table.search().select([
-            "id", "file_path", "content", "start_line", "end_line", "name"
+            "id", "file_path", "content", "start_line", "end_line", "name",
+            "node_type", "is_anchor", "context_prev", "context_next"
         ]).limit(None).to_pandas()
 
         records = df.to_dict("records")
@@ -397,6 +401,10 @@ class Indexer:
                 "start_line": r["start_line"],
                 "end_line": r["end_line"],
                 "name": r["name"],
+                "node_type": r.get("node_type", ""),
+                "is_anchor": r.get("is_anchor", False),
+                "context_prev": r.get("context_prev", ""),
+                "context_next": r.get("context_next", ""),
                 "score": 1 - r.get("_distance", 0),
             } for r in results]
         except Exception:
@@ -431,6 +439,10 @@ class Indexer:
                         "start_line": doc["start_line"],
                         "end_line": doc["end_line"],
                         "name": doc["name"],
+                        "node_type": doc.get("node_type", ""),
+                        "is_anchor": doc.get("is_anchor", False),
+                        "context_prev": doc.get("context_prev", ""),
+                        "context_next": doc.get("context_next", ""),
                         "score": float(scores[idx]),
                     })
 
