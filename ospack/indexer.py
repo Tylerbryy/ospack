@@ -68,6 +68,10 @@ def get_repo_hash(path: str) -> str:
     return hashlib.sha256(path.encode()).hexdigest()[:16]
 
 
+# Schema version - increment when adding/removing fields to force reindex
+SCHEMA_VERSION = 2  # v2: added is_anchor, context_prev, context_next, node_type
+
+
 def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
     """Worker function for parallel chunking.
 
@@ -168,6 +172,9 @@ class Indexer:
         self.storage_dir = Path.home() / ".ospack" / "index" / get_repo_hash(str(self.root_dir))
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
+        # Schema version file
+        self.version_path = self.storage_dir / "schema_version"
+
         # LanceDB setup
         self.db = lancedb.connect(str(self.storage_dir / "lancedb"))
         self.embedder = get_embedder()
@@ -247,12 +254,32 @@ class Indexer:
             }, f)
         logger.debug("Saved BM25 index to disk.")
 
+    def _check_schema_version(self) -> bool:
+        """Check if schema version matches. Returns True if rebuild needed."""
+        if not self.version_path.exists():
+            return True  # No version file, need rebuild
+
+        try:
+            stored_version = int(self.version_path.read_text().strip())
+            return stored_version != SCHEMA_VERSION
+        except (ValueError, OSError):
+            return True  # Corrupt or unreadable, need rebuild
+
+    def _save_schema_version(self) -> None:
+        """Save current schema version."""
+        self.version_path.write_text(str(SCHEMA_VERSION))
+
     def build_index(self, force: bool = False) -> int:
         """Build or incrementally update the index.
 
         Returns number of chunks indexed.
         """
         self._load_resources()
+
+        # Check schema version - force rebuild if outdated
+        if self._check_schema_version():
+            logger.info("Schema version changed, forcing full rebuild...")
+            force = True
 
         if force:
             # Full rebuild requested
@@ -349,6 +376,9 @@ class Indexer:
         # 3. Rebuild BM25 (corpus stats changed)
         if to_add or to_remove:
             self._rebuild_bm25()
+
+        # Save schema version after successful build
+        self._save_schema_version()
 
         return len(new_records)
 
