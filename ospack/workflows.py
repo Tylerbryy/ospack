@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import os
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .indexer import get_indexer
+from .chunker import get_chunker
+from .indexer import EXCLUDE_PATTERNS, INCLUDE_PATTERNS, get_indexer
+from .log import get_logger
 from .packer import extract_score
 from .resolver import get_resolver
+
+logger = get_logger(__name__)
+
+MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
 
 @dataclass
@@ -84,6 +93,18 @@ class ImpactResult:
     total_affected: int
 
 
+# --- Helper for Parallelism ---
+def _resolve_deps_worker(args: tuple[str, str]) -> tuple[str, list[str]]:
+    """Worker to resolve imports for a single file (runs in subprocess)."""
+    root_dir, file_path = args
+    try:
+        resolver = get_resolver(root_dir)
+        imports = resolver.resolve_imports(file_path)
+        return str(file_path), [str(p) for p in imports]
+    except Exception:
+        return str(file_path), []
+
+
 class Workflows:
     """High-level workflow tools for code exploration."""
 
@@ -91,6 +112,7 @@ class Workflows:
         self.root_dir = Path(root_dir).resolve()
         self.indexer = get_indexer(str(self.root_dir))
         self.resolver = get_resolver(str(self.root_dir))
+        self.chunker = get_chunker()  # Precise parsing tool
         self._reverse_deps: dict[Path, list[Path]] | None = None
 
     def find_implementation(
@@ -100,7 +122,7 @@ class Workflows:
         rerank: bool = True,
     ) -> FindResult:
         """
-        Find where a concept/function is implemented.
+        Find where a concept/function is implemented using Hybrid Search.
 
         Args:
             concept: Natural language description (e.g., "user authentication")
@@ -154,6 +176,7 @@ class Workflows:
     ) -> ExplainResult:
         """
         Get explanation of code with context.
+        Uses Chunker for PRECISE definition finding, not fuzzy search.
 
         Args:
             file: Path to the file
@@ -176,33 +199,28 @@ class Workflows:
 
         content = file_path.read_text(encoding="utf-8", errors="ignore")
 
-        # Find the target chunk
+        # 1. Precise Target Identification using Chunker
         target: CodeContext
         if function:
-            # Search for the specific function in the index
-            self.indexer.build_index()
-            results = self.indexer.search(
-                f"{function} {file_path.name}",
-                limit=10,
-                rerank=False,
-                hybrid=True,
+            # Re-parse file to find exact node
+            chunks = self.chunker.chunk(str(file_path), content)
+
+            # Look for exact name match (case-insensitive)
+            match = next(
+                (c for c in chunks if c.name and c.name.lower() == function.lower()),
+                None,
             )
-            # Find matching chunk
-            for r in results:
-                if (
-                    Path(r["file_path"]) == file_path
-                    and r.get("name", "").lower() == function.lower()
-                ):
-                    target = CodeContext(
-                        file_path=file_path,
-                        content=r["content"],
-                        start_line=r["start_line"],
-                        end_line=r["end_line"],
-                        name=r.get("name"),
-                    )
-                    break
+
+            if match:
+                target = CodeContext(
+                    file_path=file_path,
+                    content=match.content,
+                    start_line=match.start_line,
+                    end_line=match.end_line,
+                    name=match.name,
+                )
             else:
-                # Fall back to full file
+                # Fallback: Function requested but not found, return whole file
                 target = CodeContext(
                     file_path=file_path,
                     content=content,
@@ -218,22 +236,23 @@ class Workflows:
                 end_line=len(content.splitlines()),
             )
 
-        # Get imports
+        # 2. Get imports
         imports: list[Path] = []
         if include_imports:
-            imports = self.resolver.resolve_imports(file_path, content)
+            imports = list(self.resolver.resolve_imports(file_path))
 
-        # Get reverse dependencies (files that import this)
+        # 3. Get reverse dependencies (files that import this)
         imported_by: list[Path] = []
         if include_importers:
             imported_by = self._get_reverse_deps(file_path)
 
-        # Get semantically related chunks
+        # 4. Get semantically related chunks (use search for *related* logic only)
         related_chunks: list[CodeContext] = []
         if include_related and function:
             self.indexer.build_index()
+            # Contextual query combining function name and file name
             results = self.indexer.search(
-                function,
+                f"{function} {file_path.stem}",
                 limit=max_related + 5,
                 rerank=True,
                 hybrid=True,
@@ -344,14 +363,18 @@ class Workflows:
         file: str,
         function: str | None = None,
         max_depth: int = 3,
+        fuzzy_matching: bool = True,
     ) -> ImpactResult:
         """
         Analyze what would be affected by changes to a file/function.
+        Uses iterative BFS to avoid recursion limits.
+        Optionally uses "fuzzy matching" for DI frameworks.
 
         Args:
             file: Path to the file being changed
             function: Optional specific function being changed
             max_depth: Max depth for transitive analysis
+            fuzzy_matching: Use symbol-based matching for DI frameworks
 
         Returns:
             ImpactResult with affected files
@@ -361,70 +384,123 @@ class Workflows:
             file_path = self.root_dir / file_path
         file_path = file_path.resolve()
 
-        # Build reverse dependency map
+        # 1. Build Strict Graph (Cached)
         self._build_reverse_deps()
 
-        # Direct dependents
-        directly_affected = self._reverse_deps.get(file_path, [])
+        # 2. Identify "Magic" References (Fuzzy Fallback for DI frameworks)
+        magic_dependents: set[Path] = set()
 
-        # Transitive dependents
+        if fuzzy_matching:
+            try:
+                # What "Symbols" does this file export?
+                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                chunks = self.chunker.chunk(str(file_path), content)
+
+                # Filter short names to avoid false positives
+                exported_symbols = [c.name for c in chunks if c.name and len(c.name) > 4]
+
+                if exported_symbols:
+                    # Who mentions these symbols?
+                    self.indexer.build_index()
+                    for sym in exported_symbols[:5]:  # Limit to top 5 symbols
+                        results = self.indexer.search(
+                            sym, limit=20, rerank=False, hybrid=True
+                        )
+                        for r in results:
+                            potential_dep = Path(r["file_path"])
+                            # If another file mentions our class name, it's a "Magic" dependent
+                            if potential_dep != file_path:
+                                magic_dependents.add(potential_dep)
+            except Exception:
+                pass  # Graceful degradation
+
+        # 3. Merge Strict and Magic dependents
+        directly_affected = set(self._reverse_deps.get(file_path, []))
+        directly_affected.update(magic_dependents)
+
+        # 4. Iterative BFS Traversal (avoids RecursionError)
         transitively_affected: list[Path] = []
+        queue = deque([(p, 1) for p in directly_affected])  # (path, depth)
         visited = set(directly_affected)
         visited.add(file_path)
 
-        def traverse(paths: list[Path], depth: int):
-            if depth >= max_depth:
-                return
-            for p in paths:
-                dependents = self._reverse_deps.get(p, [])
-                for dep in dependents:
-                    if dep not in visited:
-                        visited.add(dep)
-                        transitively_affected.append(dep)
-                traverse(dependents, depth + 1)
+        while queue:
+            current_path, current_depth = queue.popleft()
 
-        traverse(directly_affected, 1)
+            # Record as transitive (if not direct)
+            if current_path not in directly_affected:
+                transitively_affected.append(current_path)
+
+            # Stop if max depth reached
+            if current_depth >= max_depth:
+                continue
+
+            # Find next dependents (use strict deps for traversal)
+            dependents = self._reverse_deps.get(current_path, [])
+            for dep in dependents:
+                if dep not in visited:
+                    visited.add(dep)
+                    queue.append((dep, current_depth + 1))
 
         return ImpactResult(
             target=file_path,
             function=function,
-            directly_affected=directly_affected,
+            directly_affected=list(directly_affected),
             transitively_affected=transitively_affected,
             total_affected=len(directly_affected) + len(transitively_affected),
         )
 
     def _build_reverse_deps(self):
-        """Build reverse dependency map for all source files."""
+        """Build reverse dependency graph using Parallel Processing."""
         if self._reverse_deps is not None:
             return
 
         self._reverse_deps = {}
 
-        # Get all source files (reuse indexer's file discovery)
+        # 1. Identify Source Files
         from pathspec import PathSpec
         from pathspec.patterns import GitWildMatchPattern
-
-        from .indexer import EXCLUDE_PATTERNS, INCLUDE_PATTERNS
 
         include_spec = PathSpec.from_lines(GitWildMatchPattern, INCLUDE_PATTERNS)
         exclude_spec = PathSpec.from_lines(GitWildMatchPattern, EXCLUDE_PATTERNS)
 
-        source_files = []
+        tasks: list[tuple[str, str]] = []
         for path in self.root_dir.rglob("*"):
             if not path.is_file():
                 continue
-            rel_path = str(path.relative_to(self.root_dir))
-            if include_spec.match_file(rel_path) and not exclude_spec.match_file(rel_path):
-                source_files.append(path)
+            rel = str(path.relative_to(self.root_dir))
+            if include_spec.match_file(rel) and not exclude_spec.match_file(rel):
+                tasks.append((str(self.root_dir), str(path)))
 
-        # Build forward deps then invert
-        for file_path in source_files:
-            imports = self.resolver.resolve_imports(file_path)
+        if not tasks:
+            return
+
+        # 2. Parallel Resolution
+        forward_deps: dict[Path, list[Path]] = {}
+
+        # For small repos, sequential is faster than process spawn overhead
+        if len(tasks) < 50:
+            for root_dir, file_path in tasks:
+                imports = self.resolver.resolve_imports(file_path)
+                forward_deps[Path(file_path)] = list(imports)
+        else:
+            # Parallel for larger repos
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = [executor.submit(_resolve_deps_worker, t) for t in tasks]
+                for future in as_completed(futures):
+                    f_path_str, imports_str = future.result()
+                    f_path = Path(f_path_str)
+                    forward_deps[f_path] = [Path(p) for p in imports_str]
+
+        # 3. Invert Graph (Fast, In-Memory)
+        for file_path, imports in forward_deps.items():
             for imported in imports:
                 if imported not in self._reverse_deps:
                     self._reverse_deps[imported] = []
                 if file_path not in self._reverse_deps[imported]:
                     self._reverse_deps[imported].append(file_path)
+
+        logger.debug("Built reverse deps for %d files", len(forward_deps))
 
     def _get_reverse_deps(self, file_path: Path) -> list[Path]:
         """Get files that import the given file."""

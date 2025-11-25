@@ -22,8 +22,9 @@ class Verbosity(str, Enum):
 
 logger = get_logger(__name__)
 
-# Approximate tokens per character (conservative estimate)
-CHARS_PER_TOKEN = 4
+# Token estimation - conservative for code (lots of punctuation)
+CHARS_PER_TOKEN = 3.5
+OVERHEAD_PER_FILE = 50  # XML tags, newlines, etc.
 
 # Score type definitions and their typical ranges
 SCORE_TYPES = {
@@ -45,6 +46,11 @@ def extract_score(result: dict) -> tuple[float, str]:
     elif result.get("rrf_score") is not None:
         return result["rrf_score"], "rrf"
     return result.get("score", 0), "dense"
+
+
+def _estimate_tokens(content: str) -> int:
+    """Estimate token count including overhead."""
+    return int(len(content) / CHARS_PER_TOKEN) + OVERHEAD_PER_FILE
 
 
 @dataclass
@@ -156,8 +162,31 @@ class Packer:
             PackResult with included files/chunks
         """
         result = PackResult()
-        included_paths: set[Path] = set()
-        included_chunks: set[str] = set()  # Track chunk IDs
+
+        # Unified coverage registry to prevent duplicates across Focus and Search
+        # Maps Path -> set of covered line ranges (start, end)
+        # If full file is included, range is (0, float('inf'))
+        coverage: dict[Path, set[tuple[int, float]]] = {}
+
+        def is_fully_covered(path: Path) -> bool:
+            ranges = coverage.get(path, set())
+            return (0, float("inf")) in ranges
+
+        def add_file_coverage(path: Path):
+            coverage[path] = {(0, float("inf"))}
+
+        def add_chunk_coverage(path: Path, start: int, end: int) -> bool:
+            """Return True if this chunk adds NEW info."""
+            if is_fully_covered(path):
+                return False
+
+            # Simple overlap check
+            ranges = coverage.setdefault(path, set())
+            if (start, end) in ranges:
+                return False
+
+            ranges.add((start, end))
+            return True
 
         # Track truncation reasons
         truncation_reason: str | None = None
@@ -180,22 +209,24 @@ class Packer:
                 return True  # Always allow at least one result
             return result.total_tokens < max_tokens
 
-        def _add_to_token_count(content: str) -> int:
-            tokens = len(content) // CHARS_PER_TOKEN
-            result.total_tokens += tokens
-            return tokens
-
         # 1. If focus file specified, resolve imports
         if focus:
             focus_path = Path(focus)
             if not focus_path.is_absolute():
-                focus_path = self.root_dir / focus_path
-            focus_path = focus_path.resolve()
+                focus_path = (self.root_dir / focus_path).resolve()
+            else:
+                focus_path = focus_path.resolve()
+                # Validate path is within root_dir
+                try:
+                    focus_path.relative_to(self.root_dir)
+                except ValueError:
+                    # Path is outside root_dir, treat as relative
+                    logger.warning("Focus path %s is outside root_dir, treating as relative", focus)
+                    focus_path = (self.root_dir / focus).resolve()
 
-            if focus_path.exists():
+            if focus_path.exists() and focus_path.is_file():
                 # Add focus file first
-                self._add_file(result, focus_path, "focus file", included_paths)
-                _add_to_token_count(result.files[-1].content if result.files else "")
+                self._add_file(result, focus_path, "focus file", coverage)
 
                 # Resolve imports
                 graph = self.resolver.get_dependency_graph(focus_path, max_depth=depth)
@@ -209,19 +240,17 @@ class Packer:
                     if not _within_budget():
                         truncation_reason = "token_budget"
                         break
-                    self._add_file(result, dep_path, "import", included_paths)
-                    if result.files:
-                        _add_to_token_count(result.files[-1].content)
+                    self._add_file(result, dep_path, "import", coverage)
 
         # 2. If query specified, do semantic search
-        if query:
+        if query and result.total_tokens < (max_tokens or float("inf")):
             # Build index if needed
             self.indexer.build_index()
 
             # Search for relevant chunks (hybrid + rerank)
-            # Fetch extra to account for offset
+            # Fetch extra to account for offset and deduplication
             limit = max_chunks if chunk_mode else max_files
-            search_limit = (offset + limit) * 2
+            search_limit = (offset + limit) * 3
             search_results = self.indexer.search(
                 query,
                 limit=search_limit,
@@ -243,6 +272,12 @@ class Packer:
                 if min_score is not None and score < min_score:
                     continue
 
+                path = Path(sr["file_path"])
+
+                # Skip if already fully covered (deduplication)
+                if is_fully_covered(path):
+                    continue
+
                 # Check budget (always allow first result)
                 is_first = len(result.chunks) == 0 and len(result.files) == 0
                 if not _within_budget(is_first=is_first):
@@ -251,47 +286,59 @@ class Packer:
 
                 if chunk_mode:
                     # Chunk mode: return individual chunks
-                    chunk_id = sr.get("id", f"{sr['file_path']}:{sr['start_line']}")
-                    if chunk_id in included_chunks:
-                        continue
+                    start = sr["start_line"]
+                    end = sr["end_line"]
+
+                    if not add_chunk_coverage(path, start, end):
+                        continue  # Already have this chunk
+
                     if len(result.chunks) >= max_chunks:
                         truncation_reason = "max_chunks"
                         break
 
-                    included_chunks.add(chunk_id)
+                    content = sr["content"]
+                    cost = _estimate_tokens(content)
+
+                    if result.total_tokens + cost > (max_tokens or float("inf")):
+                        truncation_reason = "token_budget"
+                        break
+
                     chunk = PackedChunk(
-                        path=Path(sr["file_path"]),
-                        content=sr["content"],
-                        start_line=sr["start_line"],
-                        end_line=sr["end_line"],
+                        path=path,
+                        content=content,
+                        start_line=start,
+                        end_line=end,
                         name=sr.get("name", ""),
                         reason=f"semantic match (score: {score:.2f})",
                         score=score,
                         score_type=item_score_type,
                     )
                     result.chunks.append(chunk)
-                    result.total_lines += sr["end_line"] - sr["start_line"] + 1
-                    result.total_chars += len(sr["content"])
-                    _add_to_token_count(sr["content"])
+                    result.total_lines += end - start + 1
+                    result.total_chars += len(content)
+                    result.total_tokens += cost
                 else:
                     # File mode: expand to full files
-                    file_path = Path(sr["file_path"])
-                    if file_path in included_paths:
-                        continue
                     if len(result.files) >= max_files:
                         truncation_reason = "max_files"
                         break
 
                     self._add_file(
                         result,
-                        file_path,
+                        path,
                         f"semantic match: {sr.get('name', 'chunk')}",
-                        included_paths,
+                        coverage,
                         score=score,
                         score_type=item_score_type,
                     )
-                    if result.files:
-                        _add_to_token_count(result.files[-1].content)
+
+        # 3. Post-processing: Merge adjacent chunks
+        if chunk_mode and result.chunks:
+            result.chunks = self._merge_chunks(result.chunks)
+            # Recalculate totals after merging
+            result.total_lines = sum(c.end_line - c.start_line + 1 for c in result.chunks)
+            result.total_chars = sum(len(c.content) for c in result.chunks)
+            result.total_tokens = sum(_estimate_tokens(c.content) for c in result.chunks)
 
         # Build truncation info
         returned = len(result.chunks) if chunk_mode else len(result.files)
@@ -330,19 +377,20 @@ class Packer:
         result: PackResult,
         file_path: Path,
         reason: str,
-        included: set[Path],
+        coverage: dict[Path, set[tuple[int, float]]],
         score: float = 1.0,
         score_type: str = "dense",
     ):
         """Add a file to the pack result."""
-        if file_path in included:
+        # Check if already fully covered
+        if (0, float("inf")) in coverage.get(file_path, set()):
             return
         if not file_path.exists():
             return
 
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
-            included.add(file_path)
+            cost = _estimate_tokens(content)
 
             result.files.append(
                 PackedFile(
@@ -355,9 +403,61 @@ class Packer:
             )
             result.total_lines += len(content.splitlines())
             result.total_chars += len(content)
+            result.total_tokens += cost
+
+            # Mark fully covered
+            coverage.setdefault(file_path, set()).add((0, float("inf")))
 
         except Exception:
             logger.warning("Could not read %s", file_path, exc_info=True)
+
+    def _merge_chunks(self, chunks: list[PackedChunk]) -> list[PackedChunk]:
+        """Merge adjacent or overlapping chunks from the same file."""
+        if not chunks:
+            return []
+
+        # Sort by file path, then start line
+        chunks.sort(key=lambda x: (x.path, x.start_line))
+
+        merged = []
+        current = chunks[0]
+
+        for next_chunk in chunks[1:]:
+            # If same file and overlap or adjacent (within 5 lines)
+            if (
+                current.path == next_chunk.path
+                and next_chunk.start_line <= current.end_line + 5
+            ):
+                # Merge by re-reading the file slice
+                try:
+                    full_content = current.path.read_text(encoding="utf-8", errors="ignore")
+                    lines = full_content.splitlines()
+
+                    new_end = max(current.end_line, next_chunk.end_line)
+                    # Python list slicing is 0-indexed, lines are 1-indexed
+                    merged_content = "\n".join(lines[current.start_line - 1 : new_end])
+
+                    current = PackedChunk(
+                        path=current.path,
+                        content=merged_content,
+                        start_line=current.start_line,
+                        end_line=new_end,
+                        name=current.name,  # Keep first name
+                        reason=current.reason,
+                        score=max(current.score, next_chunk.score),
+                        score_type=current.score_type,
+                    )
+                except Exception:
+                    # Fallback: just append strings if file read fails
+                    current.content += "\n" + next_chunk.content
+                    current.end_line = max(current.end_line, next_chunk.end_line)
+                    current.score = max(current.score, next_chunk.score)
+            else:
+                merged.append(current)
+                current = next_chunk
+
+        merged.append(current)
+        return merged
 
 
 def format_output(
