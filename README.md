@@ -1,6 +1,12 @@
-# ospack
+<div align="center">
+  <h1>ospack</h1>
+  <p><em>Semantic context packer for AI coding assistants.</em></p>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
+</div>
 
-Semantic context packer for AI coding assistants. Combines import resolution with semantic search to build optimal code context.
+<br>
+
+Combines import resolution with semantic search to build optimal code context.
 
 ## Install
 
