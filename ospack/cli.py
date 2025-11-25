@@ -303,7 +303,7 @@ def info(root: str):
     console.print(f"Device: {get_device()}")
 
     indexer = get_indexer(str(root_path))
-    console.print(f"Index path: {indexer.db_path}")
+    console.print(f"Index path: {indexer.storage_dir}")
 
     if indexer._table:
         try:

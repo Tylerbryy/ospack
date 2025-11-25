@@ -34,13 +34,13 @@ Override with `OSPACK_DEVICE=cpu` environment variable if needed.
 
 **Embedder** (`ospack/embedder.py`)
 - `Embedder` class using sentence-transformers with GPU auto-detection
-- Default model: `all-MiniLM-L6-v2` (384 dimensions)
+- Default model: `jinaai/jina-embeddings-v2-base-code` (8192 token context)
 - Lazy model loading for faster startup when not needed
 
 **Chunker** (`ospack/chunker.py`)
-- `Chunker` uses tree-sitter-languages for AST-based code chunking
-- Extracts functions, classes, methods as semantic units
-- Supports: Python, TypeScript, JavaScript, Rust, Go, Java, C/C++
+- `LangChainChunker` using langchain-text-splitters
+- Language-specific regex patterns (no tree-sitter required)
+- Supports 26+ languages: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, etc.
 
 **Indexer** (`ospack/indexer.py`)
 - `Indexer` class using LanceDB for vector storage
