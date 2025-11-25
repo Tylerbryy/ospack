@@ -29,26 +29,59 @@ def main():
 
 
 @main.command()
-@click.option("--focus", "-f", help="Focus file for import resolution")
-@click.option("--query", "-q", help="Semantic search query")
-@click.option("--max-files", "-m", default=10, type=int, help="Maximum files to include")
-@click.option("--max-chunks", "-c", default=20, type=int, help="Maximum chunks in chunk mode")
-@click.option("--max-tokens", "-t", type=int, help="Token budget (approximate)")
-@click.option("--min-score", "-s", type=float, help="Minimum relevance score (filters results)")
-@click.option("--depth", "-d", default=2, type=int, help="Import resolution depth")
 @click.option(
-    "--format",
-    "-o",
+    "--focus", "-f",
+    help="Entry point file for import graph traversal. Resolves imports transitively "
+         "up to --import-depth levels. Use when you have a specific file and want its dependencies. "
+         "Example: --focus src/auth.py"
+)
+@click.option(
+    "--query", "-q",
+    help="Natural language query for semantic search. Finds code matching the concept, "
+         "not just literal keywords. Use when searching for functionality by description. "
+         "Example: --query 'user authentication with JWT'"
+)
+@click.option(
+    "--max-files", "-m", default=10, type=int,
+    help="Maximum number of files to return. Lower values (3-5) for focused context, "
+         "higher (15-20) for broad exploration. Default: 10"
+)
+@click.option(
+    "--max-chunks", "-c", default=20, type=int,
+    help="Maximum chunks when using --format chunks. Each chunk is a function/class. Default: 20"
+)
+@click.option(
+    "--max-tokens", "-t", type=int,
+    help="Approximate token budget for output. Useful for fitting in LLM context windows. "
+         "Example: --max-tokens 8000 for ~2K tokens of headroom in a 10K context"
+)
+@click.option(
+    "--min-score", "-s", type=float,
+    help="Filter results below this relevance score (0.0-1.0). Use 0.3-0.5 for strict filtering, "
+         "lower for broader results. Not recommended unless results are too noisy."
+)
+@click.option(
+    "--import-depth", "-d", default=2, type=int,
+    help="How many levels of imports to follow from --focus file. 1=direct imports only, "
+         "2=imports of imports, 3+=deep dependency tree. Default: 2"
+)
+@click.option(
+    "--format", "-o",
     type=click.Choice(["xml", "compact", "chunks"]),
     default="xml",
-    help="Output format (chunks = optimized for agents)",
+    help="Output format. 'xml' for Claude-optimized structured output (default), "
+         "'compact' for human-readable markdown, 'chunks' for granular function-level results"
 )
-@click.option("--root", "-r", default=".", help="Repository root directory")
-@click.option("--rerank/--no-rerank", default=True, help="Use cross-encoder reranking")
-@click.option("--hybrid/--no-hybrid", default=True, help="Use hybrid BM25+dense search")
-@click.option("--offset", default=0, type=int, help="Skip first N results (pagination)")
-@click.option("--quiet", "-Q", is_flag=True, help="Minimal output (paths + scores only)")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output (include all metadata)")
+@click.option(
+    "--root", "-r", default=".",
+    help="Repository root directory (absolute path recommended). All file paths are relative to this. "
+         "Default: current directory"
+)
+@click.option("--rerank/--no-rerank", default=True, help="Use cross-encoder reranking for better relevance ordering")
+@click.option("--hybrid/--no-hybrid", default=True, help="Combine keyword (BM25) and semantic search")
+@click.option("--offset", default=0, type=int, help="Skip first N results (for pagination)")
+@click.option("--quiet", "-Q", is_flag=True, help="Paths and scores only, no code content")
+@click.option("--verbose", "-v", is_flag=True, help="Include all metadata and debug info")
 def pack(
     focus: str | None,
     query: str | None,
@@ -56,7 +89,7 @@ def pack(
     max_chunks: int,
     max_tokens: int | None,
     min_score: float,
-    depth: int,
+    import_depth: int,
     format: str,
     root: str,
     rerank: bool,
@@ -67,14 +100,25 @@ def pack(
 ):
     """Pack relevant code context for AI assistants.
 
-    Uses hybrid search (BM25 + semantic) with cross-encoder reranking by default.
+    This is the main command for gathering code context. It combines two strategies:
 
-    Use --format chunks for optimized agent context (returns code chunks instead of full files).
+    1. IMPORT RESOLUTION (--focus): Starting from a file, follow import statements
+       to find dependencies. Use when you have a specific file and need its context.
 
-    Verbosity levels:
-      --quiet   Minimal output (paths + scores only, no code)
-      (default) Normal output (code + basic metadata)
-      --verbose Full output (code + all metadata + debug info)
+    2. SEMANTIC SEARCH (--query): Find code matching a natural language description.
+       Use when searching for functionality by concept rather than file location.
+
+    You can use both together: --focus finds dependencies, --query adds related code.
+
+    OUTPUT FORMATS:
+      xml     - Structured XML optimized for Claude (default)
+      compact - Human-readable markdown
+      chunks  - Granular function/class level (best for large codebases)
+
+    EXAMPLES:
+      ospack pack --focus src/auth.py --import-depth 2
+      ospack pack --query "database connection pooling" --max-files 5
+      ospack pack --focus src/api.py --query "error handling" --format chunks
     """
     if not focus and not query:
         err = ErrorResponse.create(
@@ -108,7 +152,7 @@ def pack(
             max_chunks=max_chunks,
             max_tokens=max_tokens,
             min_score=min_score,
-            depth=depth,
+            depth=import_depth,
             rerank=rerank,
             hybrid=hybrid,
             chunk_mode=chunk_mode,
@@ -140,10 +184,30 @@ def pack(
 
 
 @main.command()
-@click.option("--root", "-r", default=".", help="Repository root directory")
-@click.option("--force", is_flag=True, help="Force rebuild even if index exists")
+@click.option(
+    "--root", "-r", default=".",
+    help="Repository root directory (absolute path recommended)"
+)
+@click.option("--force", is_flag=True, help="Delete existing index and rebuild from scratch")
 def index(root: str, force: bool):
-    """Build or rebuild the semantic index."""
+    """Build or rebuild the semantic search index.
+
+    Creates a vector index of all code in the repository for semantic search.
+    The index is stored in ~/.ospack/lancedb/{repo-hash}/ and automatically
+    updates when files change.
+
+    Run this once after cloning a repo, or use --force to rebuild after
+    major refactoring. Incremental updates happen automatically during pack/search.
+
+    WHEN TO USE:
+      - First time setup: ospack index --root /path/to/repo
+      - After git pull with many changes: ospack index (auto-updates)
+      - Index seems corrupted: ospack index --force
+
+    WHEN NOT TO USE:
+      - Before every pack command (index auto-updates)
+      - Small file changes (handled incrementally)
+    """
     from .indexer import get_indexer
 
     root_path = Path(root).resolve()
@@ -161,10 +225,27 @@ def index(root: str, force: bool):
 
 @main.command()
 @click.argument("query")
-@click.option("--root", "-r", default=".", help="Repository root directory")
-@click.option("--limit", "-l", default=10, type=int, help="Number of results")
+@click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
+@click.option("--limit", "-l", default=10, type=int, help="Maximum results to return (default: 10)")
 def search(query: str, root: str, limit: int):
-    """Search the semantic index."""
+    """Quick semantic search without full context packing.
+
+    Returns a table of matching code chunks with file paths, line numbers,
+    and relevance scores. Use this for quick lookups; use 'pack --query'
+    when you need the actual code content for an LLM.
+
+    WHEN TO USE:
+      - Quick exploration: "where is authentication handled?"
+      - Finding file locations before using --focus
+      - Verifying what the index contains
+
+    WHEN NOT TO USE:
+      - Need actual code content (use: ospack pack --query)
+      - Need to copy results to an LLM (use: ospack pack --query --format xml)
+
+    EXAMPLE:
+      ospack search "database connection pooling" --limit 5
+    """
     from .indexer import get_indexer
 
     root_path = Path(root).resolve()
@@ -200,9 +281,18 @@ def search(query: str, root: str, limit: int):
 
 
 @main.command()
-@click.option("--root", "-r", default=".", help="Repository root directory")
+@click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
 def info(root: str):
-    """Show information about the current index."""
+    """Show ospack configuration and index status.
+
+    Displays the compute device (CPU/GPU), index location, and chunk count.
+    Use this to verify ospack is configured correctly and the index exists.
+
+    USEFUL FOR:
+      - Checking if GPU acceleration is active
+      - Finding where the index is stored
+      - Verifying how many chunks are indexed
+    """
     from .embedder import get_device
     from .indexer import get_indexer
 
@@ -447,6 +537,30 @@ def impact(file: str, function: str | None, root: str, depth: int, format: str):
 
     output = format_impact_result(result, root_path, format=format)
     console.print(output)
+
+
+# ============================================================================
+# MCP Server Command
+# ============================================================================
+
+
+@main.command()
+def mcp():
+    """Start MCP server for AI agent integration.
+
+    Runs ospack as a Model Context Protocol (MCP) server over stdio.
+    AI agents like Claude can then call ospack tools directly.
+
+    INSTALL:
+      claude mcp add ospack -- ospack mcp
+
+    TOOLS EXPOSED:
+      ospack_pack   - Pack code context (focus + semantic search)
+      ospack_search - Lightweight semantic search
+      ospack_index  - Build/update search index
+    """
+    from .mcp_server import mcp as mcp_server
+    mcp_server.run()
 
 
 if __name__ == "__main__":

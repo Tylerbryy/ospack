@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from .chunker import get_chunker
-from .indexer import EXCLUDE_PATTERNS, INCLUDE_PATTERNS, get_indexer
+from .indexer import EXCLUDE_PATTERNS, is_text_file, get_indexer
 from .log import get_logger
 from .packer import extract_score
 from .resolver import get_resolver
@@ -461,7 +461,6 @@ class Workflows:
         from pathspec import PathSpec
         from pathspec.patterns import GitWildMatchPattern
 
-        include_spec = PathSpec.from_lines(GitWildMatchPattern, INCLUDE_PATTERNS)
         exclude_spec = PathSpec.from_lines(GitWildMatchPattern, EXCLUDE_PATTERNS)
 
         tasks: list[tuple[str, str]] = []
@@ -469,8 +468,11 @@ class Workflows:
             if not path.is_file():
                 continue
             rel = str(path.relative_to(self.root_dir))
-            if include_spec.match_file(rel) and not exclude_spec.match_file(rel):
-                tasks.append((str(self.root_dir), str(path)))
+            if exclude_spec.match_file(rel):
+                continue
+            if not is_text_file(path):
+                continue
+            tasks.append((str(self.root_dir), str(path)))
 
         if not tasks:
             return

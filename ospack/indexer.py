@@ -24,16 +24,41 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-INCLUDE_PATTERNS = [
-    "**/*.py", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx",
-    "**/*.go", "**/*.rs", "**/*.java", "**/*.c", "**/*.h",
-    "**/*.cpp", "**/*.hpp", "**/*.rb", "**/*.php",
-]
+# Exclude patterns - everything else is indexed if it's a text file
 EXCLUDE_PATTERNS = [
-    "node_modules/**", ".git/**", "dist/**", "build/**",
-    "__pycache__/**", ".venv/**", "venv/**", "*.pyc",
+    # Version control
+    ".git/**", ".svn/**", ".hg/**",
+    # Dependencies
+    "node_modules/**", ".venv/**", "venv/**", "vendor/**",
+    # Build outputs
+    "dist/**", "build/**", "target/**", "__pycache__/**",
+    "*.pyc", "*.pyo",
+    # IDE/Editor
+    ".idea/**", ".vscode/**", "*.swp", "*.swo",
+    # Framework caches
     ".next/**", ".turbo/**", "coverage/**",
+    # Lock files (large, low semantic value)
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.lock", "poetry.lock", "Pipfile.lock",
+    # Minified files
+    "*.min.js", "*.min.css",
 ]
+
+# File size limit (1MB default) - skip very large files
+MAX_FILE_SIZE = int(os.environ.get("OSPACK_MAX_FILE_SIZE", 1024 * 1024))
+
+
+def is_text_file(path: Path, sample_size: int = 8192) -> bool:
+    """Check if a file is text (not binary) using null-byte heuristic.
+
+    Same approach as Git - fast and reliable for code files.
+    """
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(sample_size)
+        return b"\x00" not in chunk
+    except Exception:
+        return False
 
 MAX_WORKERS = min(os.cpu_count() or 4, 8)
 
@@ -152,17 +177,40 @@ class Indexer:
         self._bm25_map: dict[str, dict] = {}  # ID -> metadata (lightweight, no vectors)
 
     def _get_source_files(self) -> dict[str, float]:
-        """Scan directory returning {filepath: mtime}."""
-        include_spec = PathSpec.from_lines(GitWildMatchPattern, INCLUDE_PATTERNS)
+        """Scan directory returning {filepath: mtime}.
+
+        Indexes ALL text files, not just known extensions.
+        Uses exclusion patterns and binary detection to filter.
+        """
         exclude_spec = PathSpec.from_lines(GitWildMatchPattern, EXCLUDE_PATTERNS)
 
         results = {}
         for path in self.root_dir.rglob("*"):
             if not path.is_file():
                 continue
+
             rel = str(path.relative_to(self.root_dir))
-            if include_spec.match_file(rel) and not exclude_spec.match_file(rel):
-                results[str(path)] = path.stat().st_mtime
+
+            # Check exclusion patterns first (fast)
+            if exclude_spec.match_file(rel):
+                continue
+
+            # Check file size limit
+            try:
+                stat = path.stat()
+                if stat.st_size > MAX_FILE_SIZE:
+                    logger.debug("Skipping large file (%d bytes): %s", stat.st_size, rel)
+                    continue
+                if stat.st_size == 0:
+                    continue  # Skip empty files
+            except OSError:
+                continue
+
+            # Check if it's a text file (binary detection)
+            if not is_text_file(path):
+                continue
+
+            results[str(path)] = stat.st_mtime
         return results
 
     def _load_resources(self):
