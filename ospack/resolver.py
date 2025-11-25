@@ -70,17 +70,40 @@ class ImportResolver:
 
     def _resolve_import(self, import_path: str, source_file: Path) -> Path | None:
         """Try to resolve an import path to a file."""
-        # Skip external packages
-        if import_path.startswith(("@", "node_modules", "http")):
+        # Skip external packages and stdlib
+        if import_path.startswith(("@", "node_modules", "http", "__future__")):
             return None
 
-        # Handle relative imports
+        # Handle relative imports (Python-style: .module, ..module, etc.)
         if import_path.startswith("."):
             base_dir = source_file.parent
-            candidates = self._get_candidates(base_dir / import_path)
+
+            # Count leading dots and strip them
+            dots = 0
+            for char in import_path:
+                if char == ".":
+                    dots += 1
+                else:
+                    break
+
+            # Go up directories for each dot beyond the first
+            for _ in range(dots - 1):
+                base_dir = base_dir.parent
+
+            # Get the module name (after the dots)
+            module_name = import_path[dots:]
+
+            # Convert dotted path to directory path (e.g., foo.bar -> foo/bar)
+            if module_name:
+                module_path = module_name.replace(".", "/")
+                candidates = self._get_candidates(base_dir / module_path)
+            else:
+                # Just dots - refers to the package itself
+                candidates = self._get_candidates(base_dir)
         else:
-            # Absolute import - try from root
-            candidates = self._get_candidates(self.root_dir / import_path)
+            # Absolute import - try from root, convert dots to path
+            module_path = import_path.replace(".", "/")
+            candidates = self._get_candidates(self.root_dir / module_path)
 
         for candidate in candidates:
             if candidate.exists() and candidate.is_file():
