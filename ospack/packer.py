@@ -33,6 +33,20 @@ SCORE_TYPES = {
 }
 
 
+def extract_score(result: dict) -> tuple[float, str]:
+    """Extract score and score_type from a search result.
+
+    Returns:
+        Tuple of (score_value, score_type) where score_type is one of:
+        "rerank", "rrf", or "dense"
+    """
+    if result.get("rerank_score") is not None:
+        return result["rerank_score"], "rerank"
+    elif result.get("rrf_score") is not None:
+        return result["rrf_score"], "rrf"
+    return result.get("score", 0), "dense"
+
+
 @dataclass
 class TruncationInfo:
     """Information about result truncation for agent guidance."""
@@ -223,16 +237,7 @@ class Packer:
                 search_results = search_results[offset:]
 
             for sr in search_results:
-                # Determine which score to use and its type
-                if sr.get("rerank_score") is not None:
-                    score = sr["rerank_score"]
-                    item_score_type = "rerank"
-                elif sr.get("rrf_score") is not None:
-                    score = sr["rrf_score"]
-                    item_score_type = "rrf"
-                else:
-                    score = sr.get("score", 0)
-                    item_score_type = "dense"
+                score, item_score_type = extract_score(sr)
 
                 # Check score threshold (only if min_score is set)
                 if min_score is not None and score < min_score:

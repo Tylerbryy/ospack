@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from .indexer import get_indexer
+from .packer import extract_score
 from .resolver import get_resolver
 
 
@@ -122,16 +123,7 @@ class Workflows:
 
         implementations = []
         for r in results[:max_results]:
-            # Determine score type
-            if r.get("rerank_score") is not None:
-                score = r["rerank_score"]
-                score_type = "rerank"
-            elif r.get("rrf_score") is not None:
-                score = r["rrf_score"]
-                score_type = "rrf"
-            else:
-                score = r.get("score", 0)
-                score_type = "dense"
+            score, score_type = extract_score(r)
 
             implementations.append(
                 Implementation(
