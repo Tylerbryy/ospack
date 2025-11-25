@@ -90,6 +90,21 @@ Or add to your MCP config:
 - **Vector store**: LanceDB
 - **Search**: BM25 + semantic + cross-encoder reranking
 
+## ospack vs osgrep
+
+ospack is inspired by [osgrep](https://github.com/Ryandonofrio3/osgrep). Both use tree-sitter, LanceDB, and hybrid search, but serve different purposes:
+
+| | **ospack** | **osgrep** |
+|---|---|---|
+| **Purpose** | Context packing for AI prompts | Semantic grep replacement |
+| **Key feature** | Import resolution + semantic search | Live server with file watching |
+| **Output** | Packed context (XML/markdown) | Search results |
+| **Language** | Python | TypeScript |
+
+**When to use osgrep**: "Find code about X" — fast semantic search tool.
+
+**When to use ospack**: "Give me everything I need to understand/modify X" — builds complete context by following imports then augmenting with semantic matches.
+
 ## License
 
 Apache-2.0
