@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,7 +14,7 @@ from pathspec import PathSpec
 from pathspec.patterns import GitWildMatchPattern
 from rank_bm25 import BM25Okapi
 
-from .chunker import get_chunker
+from .chunker import Chunk, Chunker
 from .embedder import get_embedder, get_reranker
 from .log import get_logger
 
@@ -52,6 +54,28 @@ EXCLUDE_PATTERNS = [
     "coverage/**",
     ".pytest_cache/**",
 ]
+
+# Number of workers for parallel chunking
+MAX_WORKERS = min(os.cpu_count() or 4, 8)
+
+
+def _chunk_file(file_path: str) -> list[tuple[str, Chunk]]:
+    """Chunk a single file (for parallel processing).
+
+    Returns list of (file_path, chunk) tuples.
+    Each worker creates its own Chunker since parsers aren't picklable.
+    """
+    try:
+        path = Path(file_path)
+        content = path.read_text(encoding="utf-8", errors="ignore")
+
+        # Create chunker per-worker (parsers not picklable)
+        chunker = Chunker()
+        chunks = chunker.chunk(file_path, content)
+
+        return [(file_path, chunk) for chunk in chunks]
+    except Exception:
+        return []
 
 
 def get_repo_hash(root_dir: str) -> str:
@@ -146,7 +170,6 @@ class Indexer:
 
         self.db = lancedb.connect(str(self.db_path))
         self.embedder = get_embedder()
-        self.chunker = get_chunker()
         self._table = None
 
         # BM25 index (built alongside vector index)
@@ -168,42 +191,6 @@ class Indexer:
 
         return sorted(files)
 
-    def _process_file(self, file_path: Path) -> list[dict]:
-        """Process a single file into indexed chunks."""
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
-            chunks = self.chunker.chunk(str(file_path), content)
-
-            if not chunks:
-                return []
-
-            # Generate embeddings for all chunks at once
-            texts = [c.content for c in chunks]
-            embeddings = self.embedder.embed(texts)
-
-            records = []
-            for chunk, embedding in zip(chunks, embeddings, strict=False):
-                record = {
-                    "id": hashlib.md5(
-                        f"{file_path}:{chunk.start_line}-{chunk.end_line}".encode()
-                    ).hexdigest(),
-                    "file_path": str(file_path),
-                    "content": chunk.content,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                    "node_type": chunk.node_type,
-                    "name": chunk.name or "",
-                    "last_modified": file_path.stat().st_mtime,
-                    "vector": embedding,
-                }
-                records.append(record)
-
-            return records
-
-        except Exception:
-            logger.warning("Failed to process %s", file_path, exc_info=True)
-            return []
-
     def _build_bm25_index(self, records: list[dict]):
         """Build BM25 index from records using code-aware tokenization."""
         self._bm25_docs = records
@@ -220,7 +207,11 @@ class Indexer:
         logger.debug("BM25 index built with %d documents", len(records))
 
     def build_index(self, force: bool = False) -> int:
-        """Build or rebuild the index."""
+        """Build or rebuild the index.
+
+        Uses parallel chunking for CPU-bound tree-sitter parsing,
+        then sequential embedding (ML model not thread-safe).
+        """
         table_names = self.db.table_names()
 
         if "chunks" in table_names and not force:
@@ -236,12 +227,51 @@ class Indexer:
         source_files = self._get_source_files()
         logger.info("Found %d source files", len(source_files))
 
+        # Phase 1: Parallel chunking (CPU-bound, tree-sitter parsing)
+        all_chunks: list[tuple[str, Chunk]] = []
+        file_paths = [str(f) for f in source_files]
+
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_chunk_file, fp): fp for fp in file_paths}
+            completed = 0
+            for future in as_completed(futures):
+                result = future.result()
+                all_chunks.extend(result)
+                completed += 1
+                if completed % 50 == 0:
+                    logger.debug("Chunked %d/%d files...", completed, len(source_files))
+
+        logger.info("Chunked %d files -> %d chunks", len(source_files), len(all_chunks))
+
+        if not all_chunks:
+            logger.warning("No chunks to index")
+            return 0
+
+        # Phase 2: Sequential embedding (ML model not thread-safe)
+        logger.info("Generating embeddings...")
+        texts = [chunk.content for _, chunk in all_chunks]
+        embeddings = self.embedder.embed(texts)
+
+        # Phase 3: Build records with embeddings
         all_records = []
-        for i, file_path in enumerate(source_files):
-            records = self._process_file(file_path)
-            all_records.extend(records)
-            if (i + 1) % 10 == 0:
-                logger.debug("Processed %d/%d files...", i + 1, len(source_files))
+        file_mtimes: dict[str, float] = {}  # Cache mtime lookups
+        for (file_path, chunk), embedding in zip(all_chunks, embeddings, strict=False):
+            if file_path not in file_mtimes:
+                file_mtimes[file_path] = Path(file_path).stat().st_mtime
+            record = {
+                "id": hashlib.md5(
+                    f"{file_path}:{chunk.start_line}-{chunk.end_line}".encode()
+                ).hexdigest(),
+                "file_path": file_path,
+                "content": chunk.content,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "node_type": chunk.node_type,
+                "name": chunk.name or "",
+                "last_modified": file_mtimes[file_path],
+                "vector": embedding,
+            }
+            all_records.append(record)
 
         if not all_records:
             logger.warning("No chunks to index")
