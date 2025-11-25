@@ -16,13 +16,29 @@ from pathspec.patterns import GitWildMatchPattern
 from rank_bm25 import BM25Okapi
 
 from .chunker import Chunker
-from .embedder import get_embedder, get_reranker
+from .embedder import get_embedder, get_reranker, mark_as_worker
 from .log import get_logger
 
 if TYPE_CHECKING:
     pass
 
 logger = get_logger(__name__)
+
+# Worker process state - initialized once per worker via _init_worker()
+_worker_chunker: Chunker | None = None
+
+
+def _init_worker() -> None:
+    """Initialize worker process with a reusable Chunker.
+
+    Called once per worker process when the pool starts.
+    This ensures tree-sitter parsers are created once and reused,
+    and marks this process as a worker to prevent accidental model loading.
+    """
+    global _worker_chunker
+    mark_as_worker()  # Prevent accidental embedder/reranker loading in workers
+    _worker_chunker = Chunker()
+
 
 # Exclude patterns - everything else is indexed if it's a text file
 EXCLUDE_PATTERNS = [
@@ -75,15 +91,20 @@ SCHEMA_VERSION = 2  # v2: added is_anchor, context_prev, context_next, node_type
 def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
     """Worker function for parallel chunking.
 
-    Each worker creates its own Chunker (parsers not picklable).
+    Uses the pre-initialized _worker_chunker from _init_worker().
     Returns dicts ready for embedding.
     """
+    global _worker_chunker
     file_path, mtime = args
     try:
         path = Path(file_path)
         content = path.read_text(encoding="utf-8", errors="ignore")
-        chunker = Chunker()
-        chunks = chunker.chunk(str(file_path), content)
+
+        # Use pre-initialized chunker, or create one if not initialized
+        # (e.g., if called outside ProcessPoolExecutor)
+        if _worker_chunker is None:
+            _worker_chunker = Chunker()
+        chunks = _worker_chunker.chunk(str(file_path), content)
 
         return [{
             "file_path": str(file_path),
@@ -341,7 +362,7 @@ class Indexer:
         new_records: list[dict] = []
         if to_add:
             logger.info("Chunking %d files...", len(to_add))
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker) as executor:
                 futures = [executor.submit(_chunk_file_worker, arg) for arg in to_add]
                 completed = 0
                 for future in as_completed(futures):

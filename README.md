@@ -27,17 +27,27 @@ ospack pack --focus src/api.py --query "error handling"
 |---------|-------------|
 | `ospack pack` | Pack context from focus file and/or semantic query |
 | `ospack search` | Quick semantic search |
+| `ospack map` | Generate repo structure map with signatures |
 | `ospack index` | Build/rebuild the search index |
 | `ospack info` | Show device and index info |
 
 ## Options
 
+### pack
 ```
 -f, --focus FILE      Entry point for import resolution
 -q, --query TEXT      Semantic search query
 -m, --max-files N     Max files to include (default: 10)
 -d, --import-depth N  Import traversal depth (default: 2)
 -o, --format FORMAT   Output: xml, compact, or chunks
+-p, --pagerank        Use PageRank ranking for smarter dependency ordering
+-S, --skeleton        Collapse non-focus function bodies to save tokens
+```
+
+### map
+```
+-m, --max-sigs N      Max signatures per file (default: unlimited)
+--no-signatures       Show only file tree, no code signatures
 ```
 
 ## Agent Integration
@@ -77,11 +87,58 @@ Or add to your MCP config:
 }
 ```
 
+**Available MCP Tools:**
+
+| Tool | Description |
+|------|-------------|
+| `ospack_pack` | Pack context with imports + semantic search |
+| `ospack_search` | Semantic code search |
+| `ospack_map` | Generate repo structure map |
+| `ospack_index` | Build/rebuild search index |
+| `ospack_probe` | Detect missing symbols and suggest follow-up queries |
+
+## Advanced Usage
+
+### Smart Packing with PageRank + Skeletonization
+
+```bash
+# Get optimized context: important files first, non-focus code collapsed
+ospack pack --focus src/api.py --pagerank --skeleton --max-files 5
+```
+
+PageRank identifies "hub" symbols that are referenced by many files. Skeletonization collapses function bodies to signatures in non-focus files, saving tokens while preserving structure.
+
+### Repo Mapping
+
+```bash
+# Get a bird's-eye view of the codebase
+ospack map --max-sigs 10
+
+# Output shows hierarchy with methods under classes:
+# ├── src/
+# │   ├── auth.py
+# │   │     class AuthService:
+# │   │         def login(self, user, password):
+# │   │         def logout(self):
+# │   │     ... (5 more)
+```
+
+### Iterative Context Building (MCP)
+
+Use `ospack_probe` to iteratively build complete context:
+
+1. `ospack_pack(focus="auth.py")` → get initial context
+2. `ospack_probe(content=...)` → find missing `UserModel`, `TokenService`
+3. `ospack_pack(query="UserModel definition")` → fetch missing pieces
+4. Repeat until context is complete
+
 ## How It Works
 
 1. **Hard links**: Follow imports from focus file
 2. **Soft links**: Semantic search for related code
 3. **Hybrid ranking**: BM25 + embeddings + reranking
+4. **PageRank**: Graph-based importance scoring for dependencies
+5. **Skeletonization**: AST-based body collapsing for token efficiency
 
 ## Tech
 

@@ -82,6 +82,16 @@ def main():
 @click.option("--offset", default=0, type=int, help="Skip first N results (for pagination)")
 @click.option("--quiet", "-Q", is_flag=True, help="Paths and scores only, no code content")
 @click.option("--verbose", "-v", is_flag=True, help="Include all metadata and debug info")
+@click.option(
+    "--pagerank", "-p", is_flag=True,
+    help="Use PageRank-based dependency ranking instead of simple BFS import traversal. "
+         "Identifies 'hub' symbols that are most referenced in the codebase."
+)
+@click.option(
+    "--skeleton", "-S", is_flag=True,
+    help="Skeletonize non-focus files: collapse function bodies to signatures only. "
+         "Drastically reduces tokens while preserving class/function structure."
+)
 def pack(
     focus: str | None,
     query: str | None,
@@ -97,6 +107,8 @@ def pack(
     offset: int,
     quiet: bool,
     verbose: bool,
+    pagerank: bool,
+    skeleton: bool,
 ):
     """Pack relevant code context for AI assistants.
 
@@ -110,6 +122,10 @@ def pack(
 
     You can use both together: --focus finds dependencies, --query adds related code.
 
+    ADVANCED OPTIONS:
+      --pagerank  - Use PageRank-based ranking to prioritize "hub" symbols
+      --skeleton  - Collapse non-focus function bodies to save tokens
+
     OUTPUT FORMATS:
       xml     - Structured XML optimized for Claude (default)
       compact - Human-readable markdown
@@ -119,6 +135,7 @@ def pack(
       ospack pack --focus src/auth.py --import-depth 2
       ospack pack --query "database connection pooling" --max-files 5
       ospack pack --focus src/api.py --query "error handling" --format chunks
+      ospack pack --focus src/main.py --pagerank --skeleton  # Smart + compact
     """
     if not focus and not query:
         err = ErrorResponse.create(
@@ -157,6 +174,8 @@ def pack(
             hybrid=hybrid,
             chunk_mode=chunk_mode,
             offset=offset,
+            use_pagerank=pagerank,
+            skeletonize=skeleton,
         )
 
     if not result.files and not result.chunks:
@@ -545,6 +564,46 @@ def impact(file: str, function: str | None, root: str, depth: int, format: str):
 
 
 @main.command()
+@click.option("--root", "-r", default=".", help="Repository root directory")
+@click.option("--format", "-o", type=click.Choice(["tree", "flat"]), default="tree", help="Output format")
+@click.option("--signatures/--no-signatures", default=True, help="Include function/class signatures")
+@click.option("--max-sigs", "-m", type=int, default=None, help="Max signatures per file (default: unlimited)")
+def map(root: str, format: str, signatures: bool, max_sigs: int | None):
+    """Generate a structural map of the repository.
+
+    Creates a compressed overview showing the directory structure with
+    class names, function signatures, and docstrings - no implementation details.
+
+    This gives an LLM a "birds-eye view" of the codebase before diving into
+    specific files. Useful for understanding project structure and finding
+    where functionality lives.
+
+    EXAMPLES:
+      ospack map                           # Tree view of current dir
+      ospack map --root /path/to/project   # Map another project
+      ospack map --format flat             # Flat list instead of tree
+      ospack map --no-signatures           # Just file names, no code
+      ospack map --max-sigs 30             # Limit signatures per file
+    """
+    from .mapper import generate_repo_map
+
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        console.print(f"[red]Error:[/red] Root directory not found: {root}")
+        raise SystemExit(1)
+
+    with console.status("Generating repo map..."):
+        output = generate_repo_map(
+            root_path,
+            format=format,
+            include_signatures=signatures,
+            max_sigs=max_sigs,
+        )
+
+    console.print(output)
+
+
+@main.command()
 def mcp():
     """Start MCP server for AI agent integration.
 
@@ -555,9 +614,11 @@ def mcp():
       claude mcp add ospack -- ospack mcp
 
     TOOLS EXPOSED:
-      ospack_pack   - Pack code context (focus + semantic search)
-      ospack_search - Lightweight semantic search
-      ospack_index  - Build/update search index
+      ospack_pack       - Pack code context (focus + semantic search)
+      ospack_pack_smart - Pack with PageRank ranking + skeletonization
+      ospack_search     - Lightweight semantic search
+      ospack_index      - Build/update search index
+      ospack_probe      - Analyze packed content for missing symbols (flow engineering)
     """
     from .mcp_server import mcp as mcp_server
     mcp_server.run()

@@ -13,20 +13,24 @@ Usage:
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from .indexer import get_indexer
+from .mapper import generate_repo_map
 from .packer import Packer, format_output
+from .resolver import get_repo_map
 
 mcp = FastMCP(
     "ospack",
     instructions=(
         "Semantic code context packer for AI assistants. "
-        "Use ospack_pack to gather relevant code context, ospack_search "
-        "to find code by concept, ospack_index to build the search index."
+        "Use ospack_map for a birds-eye view of repo structure, ospack_pack to gather relevant code context, "
+        "ospack_search to find code by concept, ospack_index to build the search index, "
+        "and ospack_probe to find missing symbols in packed context."
     ),
 )
 
@@ -91,6 +95,48 @@ def ospack_pack(
     )
 
     return format_output(result, format="chunks", root_dir=root_path)
+
+
+@mcp.tool()
+def ospack_map(
+    root: str,
+    include_signatures: bool = True,
+    max_sigs: int | None = None,
+) -> str:
+    """Generate a structural map of the repository.
+
+    Creates a compressed tree-view showing the directory structure with
+    class names and function signatures - no implementation details.
+    Methods are indented under their parent classes for visual hierarchy.
+
+    This gives you a "birds-eye view" of the codebase before diving into
+    specific files. Use this FIRST when exploring an unfamiliar codebase
+    to understand where files live and what they contain.
+
+    WHEN TO USE:
+    - First thing when starting work on an unfamiliar repo
+    - To understand overall project structure
+    - To find where specific functionality might live
+    - Before using ospack_pack to know what files to focus on
+
+    Args:
+        root: Repository root directory (required)
+        include_signatures: Include function/class signatures (default: True)
+        max_sigs: Maximum signatures per file to prevent context overflow (default: None = unlimited)
+
+    Returns:
+        Tree-formatted string showing directory structure with signatures
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return f"Error: Root directory does not exist: {root}"
+
+    return generate_repo_map(
+        root_path,
+        format="tree",
+        include_signatures=include_signatures,
+        max_sigs=max_sigs,
+    )
 
 
 @mcp.tool()
@@ -206,6 +252,254 @@ def ospack_index(
         "index_path": str(indexer.storage_dir),
         "status": "rebuilt" if force else ("updated" if chunks_indexed > 0 else "up_to_date"),
     }
+
+
+# Common built-in symbols to ignore when detecting missing symbols
+BUILTIN_SYMBOLS = {
+    # Python builtins
+    "print", "len", "str", "int", "float", "bool", "list", "dict", "set", "tuple",
+    "range", "enumerate", "zip", "map", "filter", "sorted", "reversed", "any", "all",
+    "min", "max", "sum", "abs", "round", "open", "isinstance", "hasattr", "getattr",
+    "setattr", "type", "super", "property", "staticmethod", "classmethod", "None",
+    "True", "False", "self", "cls", "args", "kwargs",
+    # JavaScript/TypeScript builtins
+    "console", "window", "document", "Promise", "Array", "Object", "String", "Number",
+    "Boolean", "Math", "JSON", "Date", "Error", "Map", "Set", "undefined", "null",
+    "this", "async", "await", "export", "import", "require", "module", "default",
+    # Common variable names (often false positives)
+    "i", "j", "k", "x", "y", "n", "err", "error", "result", "data", "value", "key",
+    "item", "items", "name", "path", "file", "content", "msg", "message", "text",
+}
+
+# Patterns to extract symbol references from code
+SYMBOL_PATTERNS = [
+    # Function calls: func(...)
+    re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\('),
+    # Class instantiation: new Foo(...)
+    re.compile(r'\bnew\s+([A-Z][A-Za-z0-9_]*)\s*\('),
+    # Type annotations: : Type, -> Type
+    re.compile(r'[:\-]\s*>?\s*([A-Z][A-Za-z0-9_]*)'),
+    # Generic types: List[Foo], Dict[str, Bar]
+    re.compile(r'\[([A-Z][A-Za-z0-9_]*)'),
+    # Attribute access on known patterns: Foo.bar
+    re.compile(r'\b([A-Z][A-Za-z0-9_]+)\.[a-z_]'),
+    # Import statements (to identify what's imported but maybe not defined)
+    re.compile(r'from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import'),
+    re.compile(r'import\s+([A-Za-z_][A-Za-z0-9_]*)'),
+]
+
+
+def _extract_symbols_from_content(content: str) -> set[str]:
+    """Extract symbol references from code content."""
+    symbols = set()
+    for pattern in SYMBOL_PATTERNS:
+        for match in pattern.finditer(content):
+            symbol = match.group(1)
+            # Filter out builtins and very short names
+            if symbol not in BUILTIN_SYMBOLS and len(symbol) > 2:
+                symbols.add(symbol)
+    return symbols
+
+
+def _extract_definitions_from_content(content: str) -> set[str]:
+    """Extract symbol definitions from code content."""
+    definitions = set()
+
+    # Python definitions
+    for match in re.finditer(r'\b(?:def|class|async\s+def)\s+([A-Za-z_][A-Za-z0-9_]*)', content):
+        definitions.add(match.group(1))
+
+    # JavaScript/TypeScript definitions
+    for match in re.finditer(r'\b(?:function|class|interface|type|enum)\s+([A-Za-z_][A-Za-z0-9_]*)', content):
+        definitions.add(match.group(1))
+
+    # Variable/const declarations (rough approximation)
+    for match in re.finditer(r'\b(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=', content):
+        definitions.add(match.group(1))
+
+    # Python assignments at module level (rough)
+    for match in re.finditer(r'^([A-Z][A-Za-z0-9_]*)\s*=', content, re.MULTILINE):
+        definitions.add(match.group(1))
+
+    return definitions
+
+
+@mcp.tool()
+def ospack_probe(
+    root: str,
+    content: str,
+    limit: int = 10,
+) -> dict:
+    """Analyze packed context for missing symbols and suggest follow-up queries.
+
+    This tool enables "Chain-of-Thought Retrieval" - instead of hoping one-shot
+    retrieval gets everything right, you can iteratively discover and fetch
+    missing dependencies.
+
+    HOW IT WORKS:
+    1. Extracts all symbol references from the provided code content
+    2. Identifies which symbols are used but not defined in the content
+    3. Searches the codebase to find where these missing symbols are defined
+    4. Returns suggestions for follow-up ospack_pack or ospack_search calls
+
+    WHEN TO USE:
+    - After calling ospack_pack, to find symbols that were referenced but not included
+    - When you notice undefined references in the context you received
+    - To iteratively build complete context for complex features
+
+    WORKFLOW EXAMPLE:
+    1. Call ospack_pack(focus="auth.py") -> get auth module context
+    2. Call ospack_probe(content=<packed_content>) -> find missing "User", "Token" classes
+    3. Call ospack_pack(query="User class definition") -> fetch missing pieces
+    4. Repeat until you have complete context
+
+    Args:
+        root: Repository root directory
+        content: The packed code content to analyze for missing symbols
+        limit: Maximum number of missing symbol suggestions to return
+
+    Returns:
+        Dict with:
+        - missing_symbols: List of symbols used but not defined
+        - suggestions: List of suggested follow-up queries
+        - defined_symbols: List of symbols defined in the content (for reference)
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return {"error": f"Root directory does not exist: {root}"}
+
+    # Extract symbols referenced and defined in the content
+    referenced = _extract_symbols_from_content(content)
+    defined = _extract_definitions_from_content(content)
+
+    # Find missing symbols (referenced but not defined)
+    missing = referenced - defined - BUILTIN_SYMBOLS
+
+    if not missing:
+        return {
+            "missing_symbols": [],
+            "suggestions": [],
+            "defined_symbols": list(defined)[:20],
+            "message": "No missing symbols detected. Context appears complete."
+        }
+
+    # Try to find where missing symbols are defined using the repo map
+    repo_map = get_repo_map(str(root_path))
+    if not repo_map._built:
+        # Build quickly - this caches for future calls
+        repo_map.build()
+
+    suggestions = []
+    found_symbols = []
+
+    for symbol in list(missing)[:limit]:
+        # Check if this symbol exists in the repo map
+        for symbol_key, file_path in repo_map._symbol_to_file.items():
+            if symbol_key.endswith(f":{symbol}"):
+                rel_path = str(file_path.relative_to(root_path))
+                found_symbols.append({
+                    "symbol": symbol,
+                    "file": rel_path,
+                    "suggestion": f"ospack_pack(focus='{rel_path}') or ospack_search(query='{symbol}')"
+                })
+                break
+        else:
+            # Symbol not found in repo map, suggest search
+            suggestions.append({
+                "symbol": symbol,
+                "suggestion": f"ospack_search(query='{symbol} definition')"
+            })
+
+    # Also do a quick semantic search to find potential matches
+    indexer = get_indexer(str(root_path))
+    if indexer._table is not None or indexer.bm25_path.exists():
+        for symbol in list(missing)[:5]:
+            if not any(f["symbol"] == symbol for f in found_symbols):
+                results = indexer.search(f"{symbol} definition", limit=1, rerank=False, hybrid=True)
+                if results:
+                    r = results[0]
+                    file_path = Path(r["file_path"])
+                    try:
+                        rel_path = str(file_path.relative_to(root_path))
+                    except ValueError:
+                        rel_path = str(file_path)
+                    suggestions.append({
+                        "symbol": symbol,
+                        "file": rel_path,
+                        "name": r.get("name", ""),
+                        "suggestion": f"ospack_pack(focus='{rel_path}')"
+                    })
+
+    return {
+        "missing_symbols": list(missing)[:limit],
+        "found_in_repo": found_symbols,
+        "search_suggestions": suggestions,
+        "defined_symbols": list(defined)[:20],
+        "message": f"Found {len(missing)} potentially missing symbols. Use the suggestions to fetch their definitions."
+    }
+
+
+@mcp.tool()
+def ospack_pack_smart(
+    root: str,
+    focus: str | None = None,
+    query: str | None = None,
+    max_files: int = 10,
+    import_depth: int = 2,
+    format: str = "compact",
+    use_pagerank: bool = True,
+    skeletonize: bool = True,
+) -> str:
+    """Pack relevant code context using advanced features (PageRank + Skeletonization).
+
+    This is an enhanced version of ospack_pack that uses:
+    - PageRank-based dependency ranking: Instead of simple BFS import traversal,
+      analyzes the call graph to identify "hub" symbols that are most important
+    - Skeletonization: Collapses function bodies in non-focus files to just
+      signatures, drastically reducing token usage while preserving structure
+
+    WHEN TO USE:
+    - For large codebases where token budget is a concern
+    - When you want smarter dependency prioritization
+    - When you need to see the structure of many files without full implementations
+
+    WHEN NOT TO USE:
+    - For small, focused investigations (use regular ospack_pack)
+    - When you need full implementation details of all files
+
+    Args:
+        root: Repository root directory (required)
+        focus: Entry point file for import resolution (relative to root)
+        query: Natural language search query
+        max_files: Maximum files to include (default: 10)
+        import_depth: Levels of imports to follow (default: 2)
+        format: Output format - "compact" or "xml" (default: compact)
+        use_pagerank: Use PageRank for smarter dependency ranking (default: True)
+        skeletonize: Collapse non-focus function bodies (default: True)
+
+    Returns:
+        Packed code context with skeletonized dependencies
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return f"Error: Root directory does not exist: {root}"
+
+    packer = Packer(str(root_path))
+
+    result = packer.pack(
+        focus=focus,
+        query=query,
+        max_files=max_files,
+        max_chunks=15,
+        depth=import_depth,
+        rerank=True,
+        hybrid=True,
+        chunk_mode=False,  # Return full files for skeletonization
+        use_pagerank=use_pagerank,
+        skeletonize=skeletonize,
+    )
+
+    return format_output(result, format=format, root_dir=root_path)
 
 
 def main():

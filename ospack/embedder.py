@@ -15,6 +15,19 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Flag to prevent accidental model loading in worker processes
+_in_worker_process = False
+
+
+def mark_as_worker() -> None:
+    """Mark current process as a worker (called by ProcessPoolExecutor initializer).
+
+    This prevents accidental loading of heavy ML models in worker processes,
+    which would cause each worker to load its own 2GB+ model copy.
+    """
+    global _in_worker_process
+    _in_worker_process = True
+
 # Jina V2 handles 8192 tokens - critical for code chunks that exceed 512 tokens
 # NOTE: Requires trust_remote_code=True (uses custom ALiBi architecture)
 DEFAULT_MODEL = "jinaai/jina-embeddings-v2-base-code"
@@ -156,19 +169,34 @@ _reranker: Reranker | None = None
 def get_embedder() -> Embedder:
     """Get or create the global embedder instance.
 
-    WARNING: Do not call this in ProcessPoolExecutor workers.
-    Each worker would load its own 2GB model copy, causing OOM.
-    Chunk in parallel (CPU), embed sequentially in main process (GPU).
+    Raises:
+        RuntimeError: If called from a worker process (prevents OOM from
+            each worker loading its own 2GB+ model copy).
     """
     global _embedder
+    if _in_worker_process:
+        raise RuntimeError(
+            "get_embedder() called from worker process. "
+            "Embedding must run in main process only. "
+            "Chunk in parallel (CPU), embed sequentially (GPU)."
+        )
     if _embedder is None:
         _embedder = Embedder()
     return _embedder
 
 
 def get_reranker() -> Reranker:
-    """Get or create the global reranker instance."""
+    """Get or create the global reranker instance.
+
+    Raises:
+        RuntimeError: If called from a worker process.
+    """
     global _reranker
+    if _in_worker_process:
+        raise RuntimeError(
+            "get_reranker() called from worker process. "
+            "Reranking must run in main process only."
+        )
     if _reranker is None:
         _reranker = Reranker()
     return _reranker

@@ -282,6 +282,37 @@ OVERLAP_LINES = 5  # Lines of overlap between adjacent chunks
 MAX_ANCHOR_SIZE = 2000  # Max chars for anchor chunk summary
 MAX_CONTEXT_PREVIEW = 500  # Max chars for context_prev/next
 
+# Comment prefix per language
+COMMENT_PREFIX: dict[str, str] = {
+    # Hash-style comments
+    "python": "#",
+    "ruby": "#",
+    "bash": "#",
+    "yaml": "#",
+    "toml": "#",
+    # Double-slash comments (default for most languages)
+    "javascript": "//",
+    "typescript": "//",
+    "tsx": "//",
+    "go": "//",
+    "rust": "//",
+    "java": "//",
+    "c": "//",
+    "cpp": "//",
+    "c_sharp": "//",
+    "php": "//",
+    "kotlin": "//",
+    "scala": "//",
+    "swift": "//",
+    # Other comment styles
+    "html": "<!--",
+    "css": "/*",
+    "markdown": "<!--",
+    "json": "//",  # Not valid JSON but useful for context markers
+    "elixir": "#",
+    "haskell": "--",
+}
+
 
 @dataclass
 class Chunk:
@@ -431,7 +462,7 @@ class TreeSitterChunker:
         chunks.sort(key=lambda c: (not c.is_anchor, c.start_line))
 
         # Add overlap between adjacent chunks
-        chunks = self._add_overlap(chunks, content)
+        chunks = self._add_overlap(chunks, content, lang)
 
         # Populate context neighbors
         self._populate_context_neighbors(chunks)
@@ -739,17 +770,18 @@ class TreeSitterChunker:
                 if sig:
                     signatures.append(sig)
 
-        # Build anchor content
+        # Build anchor content with language-specific comments
+        comment = COMMENT_PREFIX.get(lang, "//")
         parts: list[str] = []
 
         if imports:
-            parts.append("// Imports:\n" + "\n".join(imports[:20]))  # Limit to 20 imports
+            parts.append(f"{comment} Imports:\n" + "\n".join(imports[:20]))  # Limit to 20 imports
 
         if exports:
-            parts.append("// Exports:\n" + "\n".join(exports[:10]))  # Limit to 10 exports
+            parts.append(f"{comment} Exports:\n" + "\n".join(exports[:10]))  # Limit to 10 exports
 
         if signatures:
-            parts.append("// Definitions:\n" + "\n".join(signatures[:30]))  # Limit to 30
+            parts.append(f"{comment} Definitions:\n" + "\n".join(signatures[:30]))  # Limit to 30
 
         if not parts:
             return None
@@ -758,7 +790,7 @@ class TreeSitterChunker:
 
         # Truncate if too large
         if len(anchor_content) > MAX_ANCHOR_SIZE:
-            anchor_content = anchor_content[:MAX_ANCHOR_SIZE] + "\n// ... (truncated)"
+            anchor_content = anchor_content[:MAX_ANCHOR_SIZE] + f"\n{comment} ... (truncated)"
 
         return Chunk(
             content=anchor_content,
@@ -806,13 +838,16 @@ class TreeSitterChunker:
 
         return sig
 
-    def _add_overlap(self, chunks: list[Chunk], content: str) -> list[Chunk]:
+    def _add_overlap(self, chunks: list[Chunk], content: str, lang: str) -> list[Chunk]:
         """Add overlap lines between adjacent chunks for context continuity.
 
         Each chunk gets OVERLAP_LINES from the previous and next chunk prepended/appended.
         """
         if len(chunks) <= 1 or OVERLAP_LINES <= 0:
             return chunks
+
+        # Get language-specific comment prefix
+        comment = COMMENT_PREFIX.get(lang, "//")
 
         lines = content.split("\n")
         result: list[Chunk] = []
@@ -834,7 +869,7 @@ class TreeSitterChunker:
                 overlap_lines = lines[overlap_start:prev_end_line]
                 if overlap_lines:
                     new_content_parts.append(
-                        f"// ... (context from lines {overlap_start + 1}-{prev_end_line})\n"
+                        f"{comment} ... (context from lines {overlap_start + 1}-{prev_end_line})\n"
                         + "\n".join(overlap_lines)
                     )
 
@@ -851,7 +886,7 @@ class TreeSitterChunker:
                 if overlap_lines:
                     new_content_parts.append(
                         "\n".join(overlap_lines)
-                        + f"\n// ... (continues at line {overlap_end + 1})"
+                        + f"\n{comment} ... (continues at line {overlap_end + 1})"
                     )
 
             # Create new chunk with overlap

@@ -5,11 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from .indexer import get_indexer
 from .log import get_logger
-from .resolver import get_resolver
+from .resolver import get_repo_map, get_resolver
+
+if TYPE_CHECKING:
+    from tree_sitter import Node
 
 
 class Verbosity(str, Enum):
@@ -33,6 +36,28 @@ SCORE_TYPES = {
     "dense": {"min": 0.0, "max": 1.0, "default_threshold": 0.3},
 }
 
+# Skeletonization: Node types that have bodies which can be collapsed
+SKELETONIZABLE_TYPES = {
+    "function_definition",  # Python
+    "class_definition",  # Python
+    "function_declaration",  # JS/TS/Go/Java
+    "class_declaration",  # JS/TS/Java
+    "method_definition",  # JS/TS
+    "method_declaration",  # Java
+    "arrow_function",  # JS/TS
+    "function_item",  # Rust
+    "impl_item",  # Rust
+    "struct_item",  # Rust
+}
+
+# Node types that represent function/method bodies
+BODY_TYPES = {
+    "block",  # Python, JS/TS, Java, Go
+    "statement_block",  # JS/TS
+    "compound_statement",  # C/C++
+    "function_body",  # Various
+}
+
 
 def extract_score(result: dict) -> tuple[float, str]:
     """Extract score and score_type from a search result.
@@ -51,6 +76,269 @@ def extract_score(result: dict) -> tuple[float, str]:
 def _estimate_tokens(content: str) -> int:
     """Estimate token count including overhead."""
     return int(len(content) / CHARS_PER_TOKEN) + OVERHEAD_PER_FILE
+
+
+class Skeletonizer:
+    """Compress code files by showing only signatures for non-focus functions.
+
+    This reduces token usage while preserving structural context - the LLM can
+    see what classes/methods exist without the implementation details.
+    """
+
+    # Map extensions to tree-sitter language module names
+    EXT_TO_LANG = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".c": "c",
+        ".cpp": "cpp",
+    }
+
+    LANG_TO_MODULE = {
+        "python": ("tree_sitter_python", "language"),
+        "javascript": ("tree_sitter_javascript", "language"),
+        "typescript": ("tree_sitter_typescript", "language_typescript"),
+        "tsx": ("tree_sitter_typescript", "language_tsx"),
+        "go": ("tree_sitter_go", "language"),
+        "rust": ("tree_sitter_rust", "language"),
+        "java": ("tree_sitter_java", "language"),
+        "c": ("tree_sitter_c", "language"),
+        "cpp": ("tree_sitter_cpp", "language"),
+    }
+
+    def __init__(self):
+        self._parsers: dict[str, any] = {}
+
+    def _get_parser(self, lang: str):
+        """Get or create a parser for the given language."""
+        if lang in self._parsers:
+            return self._parsers[lang]
+
+        try:
+            import importlib
+
+            from tree_sitter import Language, Parser
+
+            if lang not in self.LANG_TO_MODULE:
+                return None
+
+            module_name, func_name = self.LANG_TO_MODULE[lang]
+            lang_module = importlib.import_module(module_name)
+            lang_func = getattr(lang_module, func_name)
+            language = Language(lang_func())
+            parser = Parser(language)
+            self._parsers[lang] = parser
+            return parser
+        except Exception as e:
+            logger.debug("Failed to get parser for %s: %s", lang, e)
+            return None
+
+    def _get_node_name(self, node: Node) -> str | None:
+        """Extract the name from a definition node."""
+        for field in ("name", "declarator"):
+            name_node = node.child_by_field_name(field)
+            if name_node:
+                while name_node.type in ("function_declarator", "pointer_declarator"):
+                    inner = name_node.child_by_field_name("declarator")
+                    if inner:
+                        name_node = inner
+                    else:
+                        break
+
+                if name_node.type in ("identifier", "type_identifier"):
+                    return name_node.text.decode("utf-8") if name_node.text else None
+                elif name_node.text:
+                    return name_node.text.decode("utf-8")
+
+        # Handle decorated_definition
+        if node.type == "decorated_definition":
+            for child in node.children:
+                if child.type in ("function_definition", "class_definition"):
+                    return self._get_node_name(child)
+
+        # Fallback
+        for child in node.children:
+            if child.type == "identifier":
+                return child.text.decode("utf-8") if child.text else None
+
+        return None
+
+    def _find_body_node(self, node: Node) -> Node | None:
+        """Find the body node within a definition."""
+        # Try common field names
+        for field in ("body", "consequence", "block"):
+            body = node.child_by_field_name(field)
+            if body:
+                return body
+
+        # Fallback: look for block-like children
+        for child in node.children:
+            if child.type in BODY_TYPES:
+                return child
+
+        return None
+
+    def _extract_signature(self, node: Node, content: str, lang: str) -> str:
+        """Extract just the signature (declaration line) of a definition."""
+        node_text = content[node.start_byte : node.end_byte]
+        lines = node_text.split("\n")
+
+        if not lines:
+            return ""
+
+        # For Python decorated definitions, include decorators
+        if node.type == "decorated_definition":
+            sig_lines = []
+            for line in lines:
+                stripped = line.strip()
+                sig_lines.append(line)
+                if stripped.startswith(("def ", "class ", "async def ")):
+                    # Include the colon
+                    if ":" in stripped:
+                        break
+                    # Multi-line signature
+                    continue
+            return "\n".join(sig_lines)
+
+        # For most languages, signature is until the opening brace or colon
+        sig = lines[0]
+
+        # Handle multi-line signatures (parameters spanning lines)
+        if sig.count("(") > sig.count(")"):
+            paren_depth = sig.count("(") - sig.count(")")
+            for line in lines[1:10]:  # Max 10 lines for signature
+                sig += "\n" + line
+                paren_depth += line.count("(") - line.count(")")
+                if paren_depth <= 0:
+                    break
+
+        return sig
+
+    def _collapse_body(self, node: Node, content: str, lang: str, indent: str) -> str:
+        """Replace a function body with '...' while preserving the signature."""
+        sig = self._extract_signature(node, content, lang)
+
+        # Determine the placeholder based on language
+        if lang == "python":
+            placeholder = f"{indent}    ..."
+        elif lang in ("go", "rust", "java", "c", "cpp"):
+            placeholder = f"{indent}    // ..."
+        else:  # JavaScript/TypeScript
+            placeholder = f"{indent}  // ..."
+
+        # Combine signature and placeholder
+        if lang == "python":
+            # Python: signature ends with colon
+            if sig.rstrip().endswith(":"):
+                return f"{sig}\n{placeholder}"
+            return f"{sig}:\n{placeholder}"
+        else:
+            # C-like languages: add braces if not present
+            if "{" in sig:
+                # Signature already has opening brace
+                sig_before_brace = sig.rsplit("{", 1)[0]
+                return f"{sig_before_brace}{{\n{placeholder}\n{indent}}}"
+            else:
+                return f"{sig} {{\n{placeholder}\n{indent}}}"
+
+    def skeletonize(
+        self,
+        file_path: Path,
+        content: str,
+        focus_symbols: set[str] | None = None,
+        focus_lines: set[int] | None = None,
+    ) -> str:
+        """Skeletonize a file, collapsing non-focus function bodies.
+
+        Args:
+            file_path: Path to the file
+            content: File content
+            focus_symbols: Set of symbol names to keep full (e.g., {"my_func", "MyClass"})
+            focus_lines: Set of line numbers to keep full (any function containing these lines)
+
+        Returns:
+            Skeletonized content with collapsed function bodies
+        """
+        lang = self.EXT_TO_LANG.get(file_path.suffix.lower())
+        if not lang:
+            return content
+
+        parser = self._get_parser(lang)
+        if not parser:
+            return content
+
+        try:
+            tree = parser.parse(bytes(content, "utf-8"))
+        except Exception:
+            return content
+
+        focus_symbols = focus_symbols or set()
+        focus_lines = focus_lines or set()
+
+        # Collect all modifications to make
+        # List of (start_byte, end_byte, replacement)
+        modifications: list[tuple[int, int, str]] = []
+
+        def should_keep_full(node: Node) -> bool:
+            """Check if a node should keep its full body."""
+            name = self._get_node_name(node)
+            if name and name in focus_symbols:
+                return True
+
+            # Check if any focus line is within this node
+            node_start_line = node.start_point[0] + 1
+            node_end_line = node.end_point[0] + 1
+            for line in focus_lines:
+                if node_start_line <= line <= node_end_line:
+                    return True
+
+            return False
+
+        def collect_modifications(node: Node, depth: int = 0):
+            """Recursively collect nodes to collapse."""
+            if node.type in SKELETONIZABLE_TYPES:
+                if not should_keep_full(node):
+                    # Calculate indentation
+                    line_start = content.rfind("\n", 0, node.start_byte) + 1
+                    indent = content[line_start : node.start_byte]
+
+                    collapsed = self._collapse_body(node, content, lang, indent)
+                    modifications.append((node.start_byte, node.end_byte, collapsed))
+                    return  # Don't recurse into collapsed nodes
+
+            # Recurse into children
+            for child in node.children:
+                collect_modifications(child, depth + 1)
+
+        collect_modifications(tree.root_node)
+
+        if not modifications:
+            return content
+
+        # Apply modifications in reverse order to preserve byte offsets
+        modifications.sort(key=lambda x: x[0], reverse=True)
+        result = content
+        for start, end, replacement in modifications:
+            result = result[:start] + replacement + result[end:]
+
+        return result
+
+
+# Global skeletonizer instance
+_skeletonizer: Skeletonizer | None = None
+
+
+def get_skeletonizer() -> Skeletonizer:
+    """Get or create the global Skeletonizer instance."""
+    global _skeletonizer
+    if _skeletonizer is None:
+        _skeletonizer = Skeletonizer()
+    return _skeletonizer
 
 
 @dataclass
@@ -141,6 +429,8 @@ class Packer:
         hybrid: bool = True,
         chunk_mode: bool = False,
         offset: int = 0,
+        use_pagerank: bool = False,
+        skeletonize: bool = False,
     ) -> PackResult:
         """
         Pack relevant code context.
@@ -157,6 +447,8 @@ class Packer:
             hybrid: Use hybrid BM25+dense search
             chunk_mode: Return chunks instead of full files
             offset: Skip first N results (for pagination)
+            use_pagerank: Use PageRank-based dependency ranking instead of simple BFS
+            skeletonize: Collapse non-focus function bodies to signatures only
 
         Returns:
             PackResult with included files/chunks
@@ -209,6 +501,10 @@ class Packer:
                 return True  # Always allow at least one result
             return result.total_tokens < max_tokens
 
+        # Track focus symbols for skeletonization
+        focus_symbols: set[str] = set()
+        focus_lines: set[int] = set()
+
         # 1. If focus file specified, resolve imports
         if focus:
             focus_path = Path(focus)
@@ -225,22 +521,45 @@ class Packer:
                     focus_path = (self.root_dir / focus).resolve()
 
             if focus_path.exists() and focus_path.is_file():
-                # Add focus file first
-                self._add_file(result, focus_path, "focus file", coverage)
+                # Add focus file first (always full content)
+                self._add_file(result, focus_path, "focus file", coverage, skeletonize=False)
 
-                # Resolve imports
-                graph = self.resolver.get_dependency_graph(focus_path, max_depth=depth)
-                deps = graph.get(focus_path, [])
-                total_available += len(deps) + 1  # +1 for focus file
+                if use_pagerank:
+                    # Use PageRank-based dependency ranking
+                    repo_map = get_repo_map(str(self.root_dir))
+                    ranked_deps = repo_map.get_ranked_dependencies(
+                        focus_path, max_files=max_files * 2
+                    )
+                    total_available += len(ranked_deps) + 1
 
-                for dep_path in deps:
-                    if len(result.files) >= max_files:
-                        truncation_reason = "max_files"
-                        break
-                    if not _within_budget():
-                        truncation_reason = "token_budget"
-                        break
-                    self._add_file(result, dep_path, "import", coverage)
+                    for dep_path, score in ranked_deps:
+                        if len(result.files) >= max_files:
+                            truncation_reason = "max_files"
+                            break
+                        if not _within_budget():
+                            truncation_reason = "token_budget"
+                            break
+                        self._add_file(
+                            result, dep_path, f"pagerank (score: {score:.4f})", coverage,
+                            score=score, skeletonize=skeletonize, focus_symbols=focus_symbols
+                        )
+                else:
+                    # Traditional BFS import resolution
+                    graph = self.resolver.get_dependency_graph(focus_path, max_depth=depth)
+                    deps = graph.get(focus_path, [])
+                    total_available += len(deps) + 1  # +1 for focus file
+
+                    for dep_path in deps:
+                        if len(result.files) >= max_files:
+                            truncation_reason = "max_files"
+                            break
+                        if not _within_budget():
+                            truncation_reason = "token_budget"
+                            break
+                        self._add_file(
+                            result, dep_path, "import", coverage,
+                            skeletonize=skeletonize, focus_symbols=focus_symbols
+                        )
 
         # 2. If query specified, do semantic search
         if query and result.total_tokens < (max_tokens or float("inf")):
@@ -323,13 +642,23 @@ class Packer:
                         truncation_reason = "max_files"
                         break
 
+                    # Track matched symbols for skeletonization
+                    matched_name = sr.get('name', '')
+                    if matched_name:
+                        focus_symbols.add(matched_name)
+                    # Track matched lines
+                    focus_lines.update(range(sr.get('start_line', 0), sr.get('end_line', 0) + 1))
+
                     self._add_file(
                         result,
                         path,
-                        f"semantic match: {sr.get('name', 'chunk')}",
+                        f"semantic match: {matched_name or 'chunk'}",
                         coverage,
                         score=score,
                         score_type=item_score_type,
+                        skeletonize=skeletonize,
+                        focus_symbols=focus_symbols,
+                        focus_lines=focus_lines,
                     )
 
         # 3. Post-processing: Merge adjacent chunks
@@ -380,8 +709,23 @@ class Packer:
         coverage: dict[Path, set[tuple[int, float]]],
         score: float = 1.0,
         score_type: str = "dense",
+        skeletonize: bool = False,
+        focus_symbols: set[str] | None = None,
+        focus_lines: set[int] | None = None,
     ):
-        """Add a file to the pack result."""
+        """Add a file to the pack result.
+
+        Args:
+            result: PackResult to add to
+            file_path: Path to the file
+            reason: Why this file was included
+            coverage: Coverage tracking dict
+            score: Relevance score
+            score_type: Type of score
+            skeletonize: Whether to collapse non-focus function bodies
+            focus_symbols: Symbols to keep full when skeletonizing
+            focus_lines: Lines to keep full when skeletonizing
+        """
         # Check if already fully covered
         if (0, float("inf")) in coverage.get(file_path, set()):
             return
@@ -390,6 +734,17 @@ class Packer:
 
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
+
+            # Apply skeletonization if requested
+            if skeletonize:
+                skeletonizer = get_skeletonizer()
+                content = skeletonizer.skeletonize(
+                    file_path, content,
+                    focus_symbols=focus_symbols,
+                    focus_lines=focus_lines
+                )
+                reason = f"{reason} [skeletonized]"
+
             cost = _estimate_tokens(content)
 
             result.files.append(
