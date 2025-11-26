@@ -54,7 +54,7 @@ ERROR_SUGGESTIONS = {
         "Check internet connection for model download, or set OSPACK_DEVICE=cpu"
     ),
     ErrorCode.OUT_OF_MEMORY: "Try reducing --max-files or --max-chunks, or use --format chunks",
-    ErrorCode.INTERNAL_ERROR: "Please report this issue at github.com/ospack/ospack",
+    ErrorCode.INTERNAL_ERROR: "Please report this issue at github.com/tylerbryy/ospack",
 }
 
 

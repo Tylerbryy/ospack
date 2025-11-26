@@ -69,7 +69,7 @@ ospack pack --focus src/api.py --query "error handling"
 
 ```bash
 # Add the ospack marketplace
-/plugin marketplace add ospack/ospack
+/plugin marketplace add tylerbryy/ospack
 
 # Install the plugin
 /plugin install ospack@ospack
