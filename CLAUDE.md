@@ -8,44 +8,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install -e .         # Install in development mode
 ospack --help            # Show CLI help
 ospack pack --help       # Show pack command help
-ospack info              # Show device (GPU) and index info
+ospack info              # Show index info and status
 ospack index             # Build/rebuild the semantic index
 ospack search "query"    # Search the index
 ```
 
 ## Architecture Overview
 
-ospack is a semantic context packer CLI written in Python. It combines **hard links** (import resolution) with **soft links** (AI-powered semantic search using embeddings) to build context packages for AI coding assistants.
-
-### GPU Acceleration
-
-ospack auto-detects the best available device for embeddings:
-- **macOS Apple Silicon**: Uses MPS (Metal Performance Shaders)
-- **NVIDIA GPU**: Uses CUDA
-- **No GPU**: Falls back to CPU
-
-Override with `OSPACK_DEVICE=cpu` environment variable if needed.
+ospack is a semantic context packer CLI written in Python. It combines **hard links** (import resolution) with **soft links** (BM25+ keyword search) to build context packages for AI coding assistants.
 
 ### Core Components
 
 **CLI** (`ospack/cli.py`)
-- Click-based CLI with commands: `pack`, `index`, `search`, `info`
+- Click-based CLI with commands: `pack`, `index`, `search`, `info`, `map`
 - Uses Rich for pretty console output
 
-**Embedder** (`ospack/embedder.py`)
-- `Embedder` class using sentence-transformers with GPU auto-detection
-- Default model: `jinaai/jina-embeddings-v2-base-code` (8192 token context)
-- Lazy model loading for faster startup when not needed
-
 **Chunker** (`ospack/chunker.py`)
-- `LangChainChunker` using langchain-text-splitters
-- Language-specific regex patterns (no tree-sitter required)
-- Supports 26+ languages: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, etc.
+- Tree-sitter based code chunking
+- Extracts functions, classes, methods as individual chunks
+- Supports 15+ languages: Python, JS/TS, Go, Rust, Java, C/C++, Ruby, etc.
 
 **Indexer** (`ospack/indexer.py`)
-- `Indexer` class using LanceDB for vector storage
-- Automatic index updates when files change
-- Per-repository indexes in `~/.ospack/lancedb/{repo-hash}/`
+- BM25+ search using `bm25s` library with numba backend
+- PyStemmer for better recall (stemming)
+- Code-aware tokenization (camelCase, snake_case splitting)
+- Memory-mapped loading for reduced RAM usage
+- Per-repository indexes in `~/.ospack/index/{repo-hash}/`
 
 **Resolver** (`ospack/resolver.py`)
 - `ImportResolver` extracts and resolves imports via regex patterns
@@ -54,7 +42,8 @@ Override with `OSPACK_DEVICE=cpu` environment variable if needed.
 **Packer** (`ospack/packer.py`)
 - `Packer` orchestrates the packing process:
   1. Focus file + import resolution (hard links)
-  2. Semantic search for query (soft links)
+  2. BM25+ search for query (soft links)
+- Skeletonization: collapse function bodies to signatures (saves tokens)
 - Output formats: XML (Claude-optimized), Compact (Markdown)
 
 ### Data Flow
@@ -64,7 +53,7 @@ User Input (focus file + query)
     ↓
 ImportResolver → Hard-linked files (imports)
     ↓
-Indexer → Soft-linked files (embedding similarity via LanceDB)
+Indexer → Soft-linked files (BM25+ keyword match)
     ↓
 Packer → Combined, deduplicated files
     ↓
@@ -73,12 +62,11 @@ format_output() → XML/Compact output
 
 ### Cache Directories
 
-- `~/.ospack/lancedb/` - LanceDB vector indexes (per repository)
-- `~/.cache/torch/sentence_transformers/` - Embedding models (shared)
+- `~/.ospack/index/` - BM25+ indexes (per repository)
 
 ## Code Style
 
 - Python 3.10+
 - Type hints throughout
 - Dataclasses for structured data
-- Global singletons for expensive resources (embedder, chunker)
+- Global singletons for expensive resources (chunker, indexer)
