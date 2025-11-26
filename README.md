@@ -102,6 +102,8 @@ Or add to your MCP config:
 | `ospack_map` | Generate repo structure map |
 | `ospack_index` | Build/rebuild search index |
 | `ospack_probe` | Detect missing symbols and suggest follow-up queries |
+| `ospack_impact` | Find files affected by changes (reverse dependency analysis) |
+| `ospack_audit` | Dry-run pack to check token costs before loading content |
 
 ## Advanced Usage
 

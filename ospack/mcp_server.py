@@ -21,7 +21,8 @@ from mcp.server.fastmcp import FastMCP
 
 from .indexer import get_indexer
 from .mapper import generate_repo_map
-from .packer import Packer, format_output
+from .packer import Packer, format_output, _estimate_tokens
+from .workflows import get_workflows
 
 mcp = FastMCP(
     "ospack",
@@ -29,7 +30,9 @@ mcp = FastMCP(
         "Semantic code context packer for AI assistants. "
         "Use ospack_map for a birds-eye view of repo structure, ospack_pack to gather relevant code context, "
         "ospack_search to find code by concept, ospack_index to build the search index, "
-        "and ospack_probe to find missing symbols in packed context."
+        "ospack_probe to find missing symbols in packed context, "
+        "ospack_impact to find files affected by changes (reverse dependency analysis), "
+        "and ospack_audit to check token costs before packing (dry-run)."
     ),
 )
 
@@ -429,6 +432,188 @@ def ospack_probe(
         "suggestions": suggestions,
         "defined_symbols": list(defined)[:20],
         "message": f"Found {len(missing)} potentially missing symbols. Use the suggestions to fetch their definitions."
+    }
+
+
+@mcp.tool()
+def ospack_impact(
+    root: str,
+    file: str,
+    function: str | None = None,
+    max_depth: int = 3,
+) -> dict:
+    """Find all files that would be affected by changes to a file/function.
+
+    This is REVERSE dependency analysis - finds who USES this code,
+    not what this code uses. Essential before refactoring to avoid breaking
+    consumers of an API.
+
+    HOW IT WORKS:
+    1. Builds reverse dependency graph by scanning all imports in the repo
+    2. Finds files that directly import the target file
+    3. Follows the chain transitively up to max_depth levels
+    4. Optionally uses fuzzy matching to catch DI framework references
+
+    WHEN TO USE:
+    - Before changing a function signature ("who calls login()?")
+    - Before renaming or moving a file
+    - To understand the blast radius of a refactor
+    - Before deprecating an API
+
+    WHEN NOT TO USE:
+    - To understand what a file depends ON (use ospack_pack instead)
+    - For simple one-file changes with no public API
+
+    Args:
+        root: Repository root directory
+        file: Path to the file being changed (relative to root)
+        function: Optional specific function being changed (for context)
+        max_depth: How many levels of transitive dependents to include (default: 3)
+
+    Returns:
+        Dict with:
+        - target: The file being analyzed
+        - function: The function being changed (if specified)
+        - directly_affected: Files that directly import/use the target
+        - transitively_affected: Files affected through dependency chain
+        - total_affected: Total count of affected files
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return {"error": f"Root directory does not exist: {root}"}
+
+    workflows = get_workflows(str(root_path))
+
+    try:
+        result = workflows.analyze_impact(
+            file=file,
+            function=function,
+            max_depth=max_depth,
+            fuzzy_matching=True,
+        )
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+
+    # Convert paths to relative strings for cleaner output
+    def rel_path(p: Path) -> str:
+        try:
+            return str(p.relative_to(root_path))
+        except ValueError:
+            return str(p)
+
+    return {
+        "target": rel_path(result.target),
+        "function": result.function,
+        "directly_affected": [rel_path(p) for p in result.directly_affected],
+        "transitively_affected": [rel_path(p) for p in result.transitively_affected],
+        "total_affected": result.total_affected,
+    }
+
+
+@mcp.tool()
+def ospack_audit(
+    root: str,
+    focus: str | None = None,
+    query: str | None = None,
+    max_files: int = 10,
+    import_depth: int = 2,
+    skeleton: bool = False,
+) -> dict:
+    """Dry-run pack to check token costs BEFORE loading content.
+
+    Returns a detailed breakdown of what would be packed and how many tokens
+    it would consume, WITHOUT returning the actual code. Use this to make
+    informed decisions about context budget.
+
+    WHEN TO USE:
+    - Before packing a large directory or query
+    - When low on context window budget
+    - To decide between full content vs skeleton mode
+    - To identify which files are consuming the most tokens
+
+    WORKFLOW EXAMPLE:
+    1. ospack_audit(focus="src/core") -> "12,500 tokens, 15 files"
+    2. If too large: ospack_audit(focus="src/core", skeleton=True) -> "4,200 tokens"
+    3. If acceptable: ospack_pack(focus="src/core", skeleton=True)
+
+    Args:
+        root: Repository root directory
+        focus: Entry point file for import resolution (relative to root)
+        query: Search query
+        max_files: Maximum files to include (default: 10)
+        import_depth: Levels of imports to follow (default: 2)
+        skeleton: Simulate skeleton mode (signatures only) for token estimate
+
+    Returns:
+        Dict with:
+        - total_tokens: Estimated total token count
+        - total_files: Number of files that would be included
+        - files: List of files with individual token costs (sorted by size)
+        - recommendation: Suggestion based on token count
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return {"error": f"Root directory does not exist: {root}"}
+
+    if not focus and not query:
+        return {"error": "Must specify focus and/or query"}
+
+    packer = Packer(str(root_path))
+
+    # Run pack to get file list
+    result = packer.pack(
+        focus=focus,
+        query=query,
+        max_files=max_files,
+        max_chunks=20,
+        depth=import_depth,
+        rerank=True,
+        hybrid=True,
+        chunk_mode=False,  # Get full files for accurate count
+        skeletonize=skeleton,
+    )
+
+    # Build file breakdown
+    file_breakdown = []
+    for f in result.files:
+        tokens = _estimate_tokens(f.content)
+        try:
+            rel_path = str(f.path.relative_to(root_path))
+        except ValueError:
+            rel_path = str(f.path)
+        file_breakdown.append({
+            "file": rel_path,
+            "tokens": tokens,
+            "lines": f.content.count("\n") + 1,
+            "reason": f.reason,
+        })
+
+    # Sort by token count (heaviest first)
+    file_breakdown.sort(key=lambda x: x["tokens"], reverse=True)
+
+    # Generate recommendation
+    total_tokens = result.total_tokens
+    if total_tokens > 15000:
+        if skeleton:
+            recommendation = f"Very large ({total_tokens} tokens). Consider reducing max_files or focusing on specific files."
+        else:
+            recommendation = f"Large result ({total_tokens} tokens). Try skeleton=True to reduce to ~{total_tokens // 3} tokens."
+    elif total_tokens > 8000:
+        if skeleton:
+            recommendation = f"Moderate size ({total_tokens} tokens). Should fit in most contexts."
+        else:
+            recommendation = f"Moderate size ({total_tokens} tokens). Consider skeleton=True if context is limited."
+    else:
+        recommendation = f"Compact result ({total_tokens} tokens). Safe to pack."
+
+    return {
+        "total_tokens": total_tokens,
+        "total_files": len(result.files),
+        "total_lines": result.total_lines,
+        "files": file_breakdown,
+        "skeleton_mode": skeleton,
+        "recommendation": recommendation,
+        "truncated": result.truncation.truncated if result.truncation else False,
     }
 
 

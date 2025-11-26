@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import tiktoken
+
 from .indexer import get_indexer
 from .log import get_logger
 from .resolver import get_resolver
@@ -25,8 +27,9 @@ class Verbosity(str, Enum):
 
 logger = get_logger(__name__)
 
-# Token estimation - conservative for code (lots of punctuation)
-CHARS_PER_TOKEN = 3.5
+# Tiktoken encoder for accurate token counting (cl100k_base = GPT-4/Claude tokenizer)
+_encoder: tiktoken.Encoding | None = None
+
 OVERHEAD_PER_FILE = 50  # XML tags, newlines, etc.
 
 # Score type definitions and their typical ranges
@@ -74,8 +77,11 @@ def extract_score(result: dict) -> tuple[float, str]:
 
 
 def _estimate_tokens(content: str) -> int:
-    """Estimate token count including overhead."""
-    return int(len(content) / CHARS_PER_TOKEN) + OVERHEAD_PER_FILE
+    """Count tokens using tiktoken (cl100k_base encoding)."""
+    global _encoder
+    if _encoder is None:
+        _encoder = tiktoken.get_encoding("cl100k_base")
+    return len(_encoder.encode(content)) + OVERHEAD_PER_FILE
 
 
 class Skeletonizer:

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0",
+    "tiktoken>=0.5",  # Accurate token counting
     "bm25s>=0.2",  # Fast BM25+ search (scipy-based)
     "numba>=0.60",  # ~2x faster retrieval via JIT compilation
     "PyStemmer>=2.0",  # Better recall via word stemming
