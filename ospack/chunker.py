@@ -530,8 +530,15 @@ class TreeSitterChunker:
         return "other"
 
     def _get_node_name(self, node: Node) -> str | None:
-        """Extract the name of a definition node."""
-        # Try common field names
+        """Extract the name of a definition node.
+
+        Handles various language constructs:
+        - Standard named definitions (functions, classes)
+        - Anonymous functions assigned to variables
+        - Rust impl blocks
+        - Decorated definitions
+        """
+        # 1. Try common field names first
         for field_name in ("name", "declarator"):
             name_node = node.child_by_field_name(field_name)
             if name_node:
@@ -548,13 +555,59 @@ class TreeSitterChunker:
                 elif name_node.text:
                     return name_node.text.decode("utf-8")
 
-        # Handle decorated_definition - look at the inner definition
+        # 2. Handle decorated_definition - look at the inner definition
         if node.type == "decorated_definition":
             for child in node.children:
                 if child.type in ("function_definition", "class_definition"):
                     return self._get_node_name(child)
 
-        # Fallback: look for first identifier child
+        # 3. Handle Rust impl blocks: "impl Foo" or "impl Trait for Type"
+        if node.type == "impl_item":
+            # Look for type field (the type being implemented)
+            type_node = node.child_by_field_name("type")
+            trait_node = node.child_by_field_name("trait")
+            if trait_node and type_node:
+                # impl Trait for Type
+                trait_name = trait_node.text.decode("utf-8") if trait_node.text else ""
+                type_name = type_node.text.decode("utf-8") if type_node.text else ""
+                if trait_name and type_name:
+                    return f"impl {trait_name} for {type_name}"
+            elif type_node:
+                # impl Type
+                type_name = type_node.text.decode("utf-8") if type_node.text else ""
+                if type_name:
+                    return f"impl {type_name}"
+
+        # 4. Handle anonymous functions/arrow functions assigned to variables
+        # Look for patterns like: const foo = () => {} or let handler = function() {}
+        if node.type in ("arrow_function", "function_expression", "function"):
+            parent = node.parent
+            # Check if parent is a variable declarator
+            if parent and parent.type in ("variable_declarator", "assignment_expression", "pair"):
+                # Get the name from the left side of the assignment
+                name_node = parent.child_by_field_name("name")
+                if not name_node:
+                    # Try "left" for assignment_expression
+                    name_node = parent.child_by_field_name("left")
+                if not name_node:
+                    # Try "key" for object pair
+                    name_node = parent.child_by_field_name("key")
+                if name_node:
+                    if name_node.type == "identifier":
+                        return name_node.text.decode("utf-8") if name_node.text else None
+                    # Handle property names (strings in objects)
+                    elif name_node.type in ("string", "property_identifier"):
+                        text = name_node.text.decode("utf-8") if name_node.text else None
+                        if text:
+                            return text.strip("'\"")
+
+        # 5. Handle Go type_spec inside type_declaration
+        if node.type == "type_spec":
+            name_node = node.child_by_field_name("name")
+            if name_node and name_node.text:
+                return name_node.text.decode("utf-8")
+
+        # 6. Look for first identifier child as last resort
         for child in node.children:
             if child.type == "identifier":
                 return child.text.decode("utf-8") if child.text else None

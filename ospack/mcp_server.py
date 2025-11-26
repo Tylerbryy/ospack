@@ -51,38 +51,53 @@ def ospack_pack(
 ) -> str:
     """Pack relevant code context for AI assistants.
 
-    Combines two strategies to gather the most relevant code:
+    This is the main tool for gathering code context. It combines import resolution (following
+    imports from a file) with semantic search (finding code by concept). The result is formatted
+    code ready to use as context for understanding, debugging, or modifying code.
 
-    1. IMPORT RESOLUTION (focus): Starting from a file, follow import
-       statements to find its dependencies. Use when you have a specific
-       file and need to understand what it uses.
+    STRATEGIES:
+    1. IMPORT RESOLUTION (focus): Starting from a file, follow import statements to find
+       dependencies. Use when you have a specific file and need to understand what it uses.
+       Example: focus="src/auth.py" finds auth.py plus all files it imports.
 
-    2. SEMANTIC SEARCH (query): Find code matching a natural language
-       description. Use when searching for functionality by concept.
+    2. SEMANTIC SEARCH (query): Find code matching a natural language description.
+       Use when searching for functionality by concept rather than file location.
+       Example: query="JWT token validation" finds relevant code across the codebase.
 
-    You can use both together: focus finds dependencies, query adds related code.
+    You can use both together: focus finds dependencies, query adds semantically related code.
 
     WHEN TO USE:
     - Need context about specific functionality
     - Investigating how features work
-    - Understanding code dependencies
+    - Understanding code dependencies before making changes
 
     WHEN NOT TO USE:
-    - Just reading a single known file (use file read instead)
+    - Just reading a single known file (use file read instead - faster)
     - Making simple edits (use direct file edit)
+    - Quick exploration (use ospack_search first to find relevant files)
+
+    OUTPUT FORMAT:
+    - "compact" (default): Markdown-formatted code blocks with file headers
+    - "xml": Structured XML with <file> tags, optimized for Claude's XML parsing
+
+    TOKEN SAVINGS:
+    - skeleton=True (default): Collapses non-focus file function bodies to just signatures.
+      Typically reduces tokens by 60-70% while preserving API structure.
+    - focus_only=True: Skips semantic search entirely. Much faster, no index needed.
 
     Args:
-        root: Repository root directory (required)
-        focus: Entry point file for import resolution (relative to root)
-        query: Natural language search query
-        max_files: Maximum files to include (default: 10)
-        import_depth: Levels of imports to follow (default: 2)
-        format: Output format - "compact" or "xml" (default: compact)
-        focus_only: Skip semantic search, only use import resolution (FAST for large repos)
-        skeleton: Collapse imported file bodies to signatures only (default: True, saves tokens)
+        root: Repository root directory. Must be absolute path.
+        focus: Entry point file for import resolution, relative to root. Example: "src/auth.py"
+        query: Natural language search query. Example: "database connection pooling"
+        max_files: Maximum files to include (default: 10). Use 3-5 for focused context, 15-20 for broad.
+        import_depth: Levels of imports to follow from focus file (default: 2). 1=direct only, 3+=deep tree.
+        format: Output format - "compact" (markdown) or "xml" (structured). Default: "compact"
+        focus_only: Skip semantic search, only use import resolution. Much faster for large repos.
+        skeleton: Collapse imported file bodies to signatures only (default: True). Saves 60-70% tokens.
 
     Returns:
-        Packed code context as formatted string
+        Packed code context as formatted string. Returns error message if root doesn't exist
+        or neither focus nor query is specified.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -117,27 +132,43 @@ def ospack_map(
 ) -> str:
     """Generate a structural map of the repository.
 
-    Creates a compressed tree-view showing the directory structure with
-    class names and function signatures - no implementation details.
-    Methods are indented under their parent classes for visual hierarchy.
+    Creates a compressed tree-view showing directory structure with class names, function
+    signatures, and docstrings - no implementation details. Methods are indented under their
+    parent classes for visual hierarchy. This is the fastest way to understand a codebase structure.
 
-    This gives you a "birds-eye view" of the codebase before diving into
-    specific files. Use this FIRST when exploring an unfamiliar codebase
-    to understand where files live and what they contain.
+    Use this FIRST when exploring an unfamiliar codebase to understand where files live and
+    what they contain, before diving into specific files with ospack_pack.
 
     WHEN TO USE:
     - First thing when starting work on an unfamiliar repo
-    - To understand overall project structure
+    - To understand overall project structure ("what modules exist?")
     - To find where specific functionality might live
     - Before using ospack_pack to know what files to focus on
 
+    WHEN NOT TO USE:
+    - Need actual code implementation (use ospack_pack)
+    - Searching for specific functionality (use ospack_search)
+
+    OUTPUT FORMAT:
+    Returns an indented tree structure like:
+        src/
+          auth/
+            login.py
+              class LoginHandler
+                def authenticate(username, password) -> bool
+                def logout(session_id)
+              def hash_password(pwd) -> str
+
     Args:
-        root: Repository root directory (required)
-        include_signatures: Include function/class signatures (default: True)
-        max_sigs: Maximum signatures per file to prevent context overflow (default: None = unlimited)
+        root: Repository root directory. Must be absolute path.
+        include_signatures: Include function/class signatures (default: True). Set False for
+            just file names when you only need directory structure.
+        max_sigs: Maximum signatures per file (default: None = unlimited). Use 10-30 for large
+            repos to prevent context overflow. Files with more signatures show "[N more...]".
 
     Returns:
-        Tree-formatted string showing directory structure with signatures
+        Tree-formatted string showing directory structure with optional signatures.
+        Returns error message if root directory doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -156,29 +187,42 @@ def ospack_search(
     root: str,
     query: str,
     limit: int = 10,
+    min_score: float | None = None,
 ) -> list[dict]:
     """Search codebase semantically using natural language.
 
-    Finds code chunks that match the conceptual meaning of your query,
-    even if they don't contain the exact keywords. Uses AI embeddings
-    to understand code semantics.
+    Finds code chunks that match the conceptual meaning of your query, even if they
+    don't contain the exact keywords. Uses BM25+ keyword search with optional reranking
+    for best relevance. This is lighter weight than ospack_pack - use it for quick
+    exploration before committing to full context packing.
 
     WHEN TO USE:
-    - Exploring unfamiliar codebase
+    - Exploring unfamiliar codebase ("where is authentication handled?")
     - Finding where functionality is implemented
-    - Discovering related code
+    - Discovering related code before using ospack_pack
 
     WHEN NOT TO USE:
-    - Know exact file/function name (use file read)
+    - Know exact file/function name (use file read instead)
     - Need full context with imports (use ospack_pack)
+    - Need exact pattern match with punctuation (use ospack_grep)
+
+    OUTPUT FORMAT:
+    Returns a list of dicts, each containing: file_path (relative), name (function/class
+    name if available), start_line, end_line, score (0-25 typical range, higher is better),
+    and content (truncated to 500 chars for overview).
 
     Args:
-        root: Repository root directory
-        query: Natural language description of what you're looking for
-        limit: Maximum results to return (default: 10)
+        root: Repository root directory. Must be absolute path.
+        query: Natural language description of what you're looking for. Be specific -
+            "OAuth token refresh logic" works better than just "auth".
+        limit: Maximum results to return (default: 10, max recommended: 20).
+        min_score: Filter results below this BM25+ score. Typical good matches score 8-25.
+            Use 5-8 for broad results, 10+ for high-confidence matches only. Default: None
+            (no filtering). Set this when you're getting too many low-relevance results.
 
     Returns:
-        List of matches with file_path, content, score, start_line, end_line, name
+        List of matches. Each match has: file_path, name, start_line, end_line, score, content.
+        Returns [{"error": "..."}] if root directory doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -200,6 +244,13 @@ def ospack_search(
     # Clean up results for MCP output
     clean_results = []
     for r in results:
+        # Get the best available score
+        score = r.get("rerank_score") or r.get("rrf_score") or r.get("score", 0)
+
+        # Filter by min_score if specified
+        if min_score is not None and score < min_score:
+            continue
+
         # Make file_path relative to root for readability
         file_path = Path(r["file_path"])
         try:
@@ -212,7 +263,7 @@ def ospack_search(
             "name": r.get("name", ""),
             "start_line": r.get("start_line", 0),
             "end_line": r.get("end_line", 0),
-            "score": round(r.get("rerank_score") or r.get("rrf_score") or r.get("score", 0), 3),
+            "score": round(score, 3),
             "content": r.get("content", "")[:500],  # Truncate for overview
         })
 
@@ -228,27 +279,45 @@ def ospack_grep(
 ) -> list[dict]:
     """Fast exact/regex code search using trigram index.
 
-    Unlike ospack_search (semantic/BM25), this finds EXACT patterns
-    including punctuation. Uses trigram pre-filtering for speed.
+    Unlike ospack_search (semantic/BM25), this finds EXACT patterns including punctuation
+    and special characters. Uses trigram-based pre-filtering for speed - first narrows down
+    candidate files using a trigram index, then verifies matches. Best for finding specific
+    code patterns where you know the exact syntax.
 
     WHEN TO USE:
-    - API calls: ".map(", "useState("
-    - Operators: "=>", "??"
-    - Regex patterns: r"async function \\w+"
-    - Exact strings with special characters
+    - API calls with punctuation: ".map(", "useState(", "->>"
+    - Operators and symbols: "=>", "??", "..."
+    - Regex patterns: regex=True with "async\\s+function\\s+\\w+"
+    - Exact strings that BM25 tokenization would break up
 
     WHEN NOT TO USE:
-    - Fuzzy/conceptual search (use ospack_search)
+    - Fuzzy/conceptual search (use ospack_search - it understands meaning)
     - Finding code by meaning, not exact text
+    - Very short patterns (<3 chars) - trigram index requires at least 3 characters
+
+    REGEX MODE:
+    When regex=True, the pattern is interpreted as a Python regular expression.
+    The tool extracts literal substrings from the regex for trigram pre-filtering,
+    then runs full regex matching on candidate files. Example patterns:
+    - "class\\s+\\w+Service" - finds class definitions ending in Service
+    - "def\\s+(get|set)_\\w+" - finds getter/setter methods
+    - "TODO.*\\d{4}" - finds TODOs with year numbers
+
+    OUTPUT FORMAT:
+    Returns list of dicts with: file (relative path), line (1-indexed line number),
+    match (the matched text), context (2 lines before/after for context).
 
     Args:
-        root: Repository root directory
-        pattern: Literal string or regex pattern to search
-        regex: If True, treat pattern as regex (default: False)
-        limit: Maximum results to return (default: 20)
+        root: Repository root directory. Must be absolute path.
+        pattern: Literal string or regex pattern to search. Must be at least 3 characters
+            for effective trigram filtering (shorter patterns may be slow).
+        regex: If True, treat pattern as Python regex (default: False). Without this flag,
+            special characters like .* are matched literally.
+        limit: Maximum results to return (default: 20). Results are returned in file order.
 
     Returns:
-        List of {file, line, match, context}
+        List of matches. Each match has: file, line, match, context.
+        Returns [{"error": "..."}] if root directory doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -292,27 +361,41 @@ def ospack_index(
 ) -> dict:
     """Build or update the semantic search index for a repository.
 
-    Creates embeddings for all code chunks to enable semantic search.
-    Runs incrementally - only processes changed files unless force=True.
+    Creates a BM25+ keyword index of all code chunks to enable semantic search. Chunks are
+    extracted using tree-sitter parsing (functions, classes, methods). The index runs
+    incrementally by default - only processing files that changed since last indexing.
 
-    The index is stored in ~/.ospack/index/{repo-hash}/ and persists
-    between sessions.
+    Index storage: ~/.ospack/index/{repo-hash}/ - persists between sessions and is keyed
+    by repository path hash. Each repo gets its own isolated index.
 
     WHEN TO USE:
-    - First time using ospack on a repository
-    - After significant code changes
-    - If search results seem stale
+    - First time using ospack on a new repository
+    - After major refactoring or branch switches with many file changes
+    - If search results seem stale or missing recent code
+    - Use force=True if index seems corrupted
 
     WHEN NOT TO USE:
-    - Index already exists and code hasn't changed
-    - Just want to search (index builds automatically if needed)
+    - Before every search/pack (index auto-updates on search if needed)
+    - After small file changes (handled incrementally and automatically)
+    - Just want to search (ospack_search builds index automatically if missing)
+
+    PERFORMANCE:
+    - Initial indexing: ~1-3 seconds for small repos (<200 files), ~5-10s for medium repos
+    - Incremental updates: Usually <1 second (only processes changed files)
+    - force=True rebuilds everything from scratch
+
+    OUTPUT FORMAT:
+    Returns dict with: chunks_indexed (number of code chunks), time_taken (seconds),
+    index_path (where index is stored), status ("rebuilt", "updated", or "up_to_date").
 
     Args:
-        root: Repository root directory
-        force: Rebuild from scratch (default: False)
+        root: Repository root directory. Must be absolute path.
+        force: Rebuild index from scratch, ignoring cached state (default: False).
+            Use when index seems corrupted or after major branch switches.
 
     Returns:
-        Stats dict with chunks_indexed, time_taken
+        Stats dict with chunks_indexed, time_taken, index_path, status.
+        Returns {"error": "..."} if root directory doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -410,37 +493,49 @@ def ospack_probe(
 ) -> dict:
     """Analyze packed context for missing symbols and suggest follow-up queries.
 
-    This tool enables "Chain-of-Thought Retrieval" - instead of hoping one-shot
-    retrieval gets everything right, you can iteratively discover and fetch
-    missing dependencies.
+    This tool enables "Chain-of-Thought Retrieval" - instead of hoping one-shot retrieval
+    gets everything right, you can iteratively discover and fetch missing dependencies.
+    Pass the output from ospack_pack and get suggestions for what else to fetch.
 
     HOW IT WORKS:
-    1. Extracts all symbol references from the provided code content
+    1. Parses the provided code to extract all symbol references (function calls,
+       class instantiations, type annotations, imports)
     2. Identifies which symbols are used but not defined in the content
     3. Searches the codebase to find where these missing symbols are defined
-    4. Returns suggestions for follow-up ospack_pack or ospack_search calls
+    4. Returns actionable suggestions for follow-up ospack_pack or ospack_search calls
 
     WHEN TO USE:
     - After calling ospack_pack, to find symbols that were referenced but not included
     - When you notice undefined references in the context you received
     - To iteratively build complete context for complex features
+    - Before making changes that depend on understanding related code
+
+    WHEN NOT TO USE:
+    - Content is already complete (no missing symbols)
+    - You know exactly what files you need (use ospack_pack directly)
 
     WORKFLOW EXAMPLE:
-    1. Call ospack_pack(focus="auth.py") -> get auth module context
-    2. Call ospack_probe(content=<packed_content>) -> find missing "User", "Token" classes
-    3. Call ospack_pack(query="User class definition") -> fetch missing pieces
-    4. Repeat until you have complete context
+    1. ospack_pack(focus="auth.py") -> get auth module context
+    2. ospack_probe(content=<packed_output>) -> finds missing "User", "Token" classes
+    3. ospack_pack(query="User class definition") -> fetch missing pieces
+    4. Repeat until ospack_probe returns no missing symbols
+
+    OUTPUT FORMAT:
+    Returns dict with:
+    - missing_symbols: List of symbol names that are referenced but not defined
+    - suggestions: List of dicts with {symbol, file (if found), suggestion (ospack command)}
+    - defined_symbols: List of symbols that ARE defined in the content (for reference)
+    - message: Human-readable summary
 
     Args:
-        root: Repository root directory
-        content: The packed code content to analyze for missing symbols
-        limit: Maximum number of missing symbol suggestions to return
+        root: Repository root directory. Must be absolute path.
+        content: The packed code content to analyze. Pass the full output from ospack_pack.
+        limit: Maximum number of missing symbol suggestions to return (default: 10).
+            Higher values find more symbols but increase processing time.
 
     Returns:
-        Dict with:
-        - missing_symbols: List of symbols used but not defined
-        - suggestions: List of suggested follow-up queries
-        - defined_symbols: List of symbols defined in the content (for reference)
+        Dict with missing_symbols, suggestions, defined_symbols, and message.
+        Returns {"error": "..."} if root directory doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -511,39 +606,50 @@ def ospack_impact(
 ) -> dict:
     """Find all files that would be affected by changes to a file/function.
 
-    This is REVERSE dependency analysis - finds who USES this code,
-    not what this code uses. Essential before refactoring to avoid breaking
-    consumers of an API.
+    This is REVERSE dependency analysis - finds who USES this code, not what this code uses.
+    Essential before refactoring to understand the blast radius and avoid breaking consumers.
+    Unlike ospack_pack (which finds what a file depends ON), this finds what depends ON a file.
 
     HOW IT WORKS:
-    1. Builds reverse dependency graph by scanning all imports in the repo
+    1. Scans all imports in the repository to build a reverse dependency graph
     2. Finds files that directly import the target file
-    3. Follows the chain transitively up to max_depth levels
-    4. Optionally uses fuzzy matching to catch DI framework references
+    3. Follows the import chain transitively up to max_depth levels
+    4. Uses fuzzy matching to catch dependency injection and dynamic imports
 
     WHEN TO USE:
     - Before changing a function signature ("who calls login()?")
     - Before renaming or moving a file
-    - To understand the blast radius of a refactor
+    - To understand blast radius before a refactor
     - Before deprecating an API
+    - To find all tests that cover a module
 
     WHEN NOT TO USE:
-    - To understand what a file depends ON (use ospack_pack instead)
+    - To understand what a file depends ON (use ospack_pack with focus instead)
     - For simple one-file changes with no public API
 
+    TERMINOLOGY:
+    - directly_affected: Files that have an explicit import of the target file
+    - transitively_affected: Files that import files that import the target (indirect deps)
+
+    OUTPUT FORMAT:
+    Returns dict with:
+    - target: The file being analyzed (relative path)
+    - function: The specific function being changed (if specified)
+    - directly_affected: List of file paths that directly import the target
+    - transitively_affected: List of file paths affected through dependency chain
+    - total_affected: Total count of all affected files
+
     Args:
-        root: Repository root directory
-        file: Path to the file being changed (relative to root)
-        function: Optional specific function being changed (for context)
-        max_depth: How many levels of transitive dependents to include (default: 3)
+        root: Repository root directory. Must be absolute path.
+        file: Path to the file being changed, relative to root. Example: "src/auth/login.py"
+        function: Optional specific function being changed. Included in output for context
+            but doesn't change the analysis (impact is file-level).
+        max_depth: How many levels of transitive dependents to include (default: 3).
+            1=direct importers only, 2=importers of importers, etc.
 
     Returns:
-        Dict with:
-        - target: The file being analyzed
-        - function: The function being changed (if specified)
-        - directly_affected: Files that directly import/use the target
-        - transitively_affected: Files affected through dependency chain
-        - total_affected: Total count of affected files
+        Dict with target, function, directly_affected, transitively_affected, total_affected.
+        Returns {"error": "..."} if root or file doesn't exist.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
@@ -586,37 +692,58 @@ def ospack_audit(
     import_depth: int = 2,
     skeleton: bool = False,
 ) -> dict:
-    """Dry-run pack to check token costs BEFORE loading content.
+    """Dry-run pack to check token costs BEFORE loading full content.
 
-    Returns a detailed breakdown of what would be packed and how many tokens
-    it would consume, WITHOUT returning the actual code. Use this to make
-    informed decisions about context budget.
+    Returns a detailed breakdown of what would be packed and how many tokens it would consume,
+    WITHOUT returning the actual code. Use this to make informed decisions about context
+    budget before committing to a potentially large ospack_pack call.
+
+    Token estimation uses ~4 characters per token (GPT-style tokenization). Results are sorted
+    by token count so you can see which files are consuming the most budget.
 
     WHEN TO USE:
-    - Before packing a large directory or query
-    - When low on context window budget
+    - Before packing a large directory or broad query
+    - When running low on context window budget
     - To decide between full content vs skeleton mode
     - To identify which files are consuming the most tokens
+    - To compare different packing strategies
+
+    WHEN NOT TO USE:
+    - You already know the files are small
+    - You're doing quick exploration (just use ospack_pack)
 
     WORKFLOW EXAMPLE:
     1. ospack_audit(focus="src/core") -> "12,500 tokens, 15 files"
-    2. If too large: ospack_audit(focus="src/core", skeleton=True) -> "4,200 tokens"
-    3. If acceptable: ospack_pack(focus="src/core", skeleton=True)
+    2. Too large? ospack_audit(focus="src/core", skeleton=True) -> "4,200 tokens"
+    3. Acceptable? ospack_pack(focus="src/core", skeleton=True)
+
+    RECOMMENDATION THRESHOLDS:
+    - <8,000 tokens: "Compact result - safe to pack"
+    - 8,000-15,000 tokens: "Moderate size - consider skeleton mode"
+    - >15,000 tokens: "Large result - reduce max_files or use skeleton mode"
+
+    OUTPUT FORMAT:
+    Returns dict with:
+    - total_tokens: Estimated total token count (~4 chars/token)
+    - total_files: Number of files that would be included
+    - total_lines: Total lines of code
+    - files: List of {file, tokens, lines, reason} sorted by tokens descending
+    - skeleton_mode: Whether skeleton mode was simulated
+    - recommendation: Human-readable suggestion based on token count
+    - truncated: Whether results were truncated due to limits
 
     Args:
-        root: Repository root directory
-        focus: Entry point file for import resolution (relative to root)
-        query: Search query
-        max_files: Maximum files to include (default: 10)
-        import_depth: Levels of imports to follow (default: 2)
-        skeleton: Simulate skeleton mode (signatures only) for token estimate
+        root: Repository root directory. Must be absolute path.
+        focus: Entry point file for import resolution, relative to root.
+        query: Natural language search query.
+        max_files: Maximum files to include (default: 10).
+        import_depth: Levels of imports to follow from focus file (default: 2).
+        skeleton: Simulate skeleton mode (signatures only) for token estimate (default: False).
+            Use True to see how much skeleton mode would save.
 
     Returns:
-        Dict with:
-        - total_tokens: Estimated total token count
-        - total_files: Number of files that would be included
-        - files: List of files with individual token costs (sorted by size)
-        - recommendation: Suggestion based on token count
+        Dict with token breakdown, file list, and recommendation.
+        Returns {"error": "..."} if root doesn't exist or neither focus nor query specified.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():

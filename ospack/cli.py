@@ -255,7 +255,12 @@ def index(root: str, force: bool):
 @click.argument("query")
 @click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
 @click.option("--limit", "-l", default=10, type=int, help="Maximum results to return (default: 10)")
-def search(query: str, root: str, limit: int):
+@click.option(
+    "--min-score", "-s", type=float, default=None,
+    help="Filter results below this BM25+ score. Scores typically range 5-25 for good matches. "
+         "Use to reduce noise from low-relevance results. Example: --min-score 8.0"
+)
+def search(query: str, root: str, limit: int, min_score: float | None):
     """Quick semantic search without full context packing.
 
     Returns a table of matching code chunks with file paths, line numbers,
@@ -276,6 +281,11 @@ def search(query: str, root: str, limit: int):
     """
     from .indexer import get_indexer
 
+    # Validate query
+    if not query or not query.strip():
+        console.print("[yellow]Empty query - please provide search terms[/yellow]")
+        return
+
     root_path = Path(root).resolve()
     indexer = get_indexer(str(root_path))
 
@@ -283,6 +293,10 @@ def search(query: str, root: str, limit: int):
     indexer.build_index()
 
     results = indexer.search(query, limit=limit)
+
+    # Filter by min_score if specified
+    if min_score is not None:
+        results = [r for r in results if (r.get("rerank_score") or r.get("rrf_score") or r.get("score", 0)) >= min_score]
 
     if not results:
         console.print("[yellow]No results found[/yellow]")
@@ -311,7 +325,12 @@ def search(query: str, root: str, limit: int):
 @main.command()
 @click.argument("pattern")
 @click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
-@click.option("--regex", "-E", is_flag=True, help="Treat pattern as regular expression")
+@click.option(
+    "--regex", "-E", is_flag=True,
+    help="Enable Python regex matching (re module). Without this flag, patterns are matched "
+         "literally - special chars like .* are not interpreted as regex. Regex mode still "
+         "benefits from trigram pre-filtering for speed. Example: -E 'async\\s+function\\s+\\w+'"
+)
 @click.option("--limit", "-l", default=20, type=int, help="Maximum results to return (default: 20)")
 def grep(pattern: str, root: str, regex: bool, limit: int):
     """Exact pattern search (preserves punctuation).
