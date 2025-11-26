@@ -1,17 +1,14 @@
-"""GPU-accelerated embeddings using sentence-transformers."""
+"""GPU-accelerated embeddings using sentence-transformers (lazy loaded)."""
 
 from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
 
-import torch
-from sentence_transformers import CrossEncoder, SentenceTransformer
-
 from .log import get_logger
 
 if TYPE_CHECKING:
-    pass
+    from sentence_transformers import CrossEncoder, SentenceTransformer
 
 logger = get_logger(__name__)
 
@@ -28,9 +25,9 @@ def mark_as_worker() -> None:
     global _in_worker_process
     _in_worker_process = True
 
-# Jina V2 handles 8192 tokens - critical for code chunks that exceed 512 tokens
-# NOTE: Requires trust_remote_code=True (uses custom ALiBi architecture)
-DEFAULT_MODEL = "jinaai/jina-embeddings-v2-base-code"
+# MiniLM - fast and lightweight (22M params, 256 token context)
+# Good balance of speed vs quality for code search
+DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Cross-encoder for reranking
 # NOTE: This model only sees the first 512 tokens - ensure relevant info is at start
@@ -43,6 +40,7 @@ def get_device() -> str:
     if env_device := os.environ.get("OSPACK_DEVICE"):
         return env_device.lower()
 
+    import torch
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -67,10 +65,9 @@ class Embedder:
                 self._model = SentenceTransformer(
                     self.model_name,
                     device=self.device,
-                    trust_remote_code=True,  # REQUIRED for Jina models (custom ALiBi)
                 )
-                # Explicitly set max seq length for Jina's 8192 context
-                self._model.max_seq_length = 8192
+                # MiniLM has 256 token context - chunks should be small
+                self._model.max_seq_length = 256
                 logger.info("Embedding model loaded.")
             except Exception as e:
                 logger.error("Failed to load embedding model: %s", e)

@@ -346,7 +346,7 @@ class Chunk:
 class TreeSitterChunker:
     """AST-based chunker using tree-sitter for semantic code extraction."""
 
-    MAX_CHUNK_SIZE = 4000  # chars - split large functions
+    MAX_CHUNK_SIZE = 800  # chars - MiniLM has 256 token context (~4 chars/token)
     MIN_CHUNK_SIZE = 50  # chars - skip trivial chunks
 
     def __init__(self):

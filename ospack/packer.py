@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal
 
 from .indexer import get_indexer
 from .log import get_logger
-from .resolver import get_repo_map, get_resolver
+from .resolver import get_resolver
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -429,7 +429,6 @@ class Packer:
         hybrid: bool = True,
         chunk_mode: bool = False,
         offset: int = 0,
-        use_pagerank: bool = False,
         skeletonize: bool = False,
     ) -> PackResult:
         """
@@ -447,7 +446,6 @@ class Packer:
             hybrid: Use hybrid BM25+dense search
             chunk_mode: Return chunks instead of full files
             offset: Skip first N results (for pagination)
-            use_pagerank: Use PageRank-based dependency ranking instead of simple BFS
             skeletonize: Collapse non-focus function bodies to signatures only
 
         Returns:
@@ -524,42 +522,22 @@ class Packer:
                 # Add focus file first (always full content)
                 self._add_file(result, focus_path, "focus file", coverage, skeletonize=False)
 
-                if use_pagerank:
-                    # Use PageRank-based dependency ranking
-                    repo_map = get_repo_map(str(self.root_dir))
-                    ranked_deps = repo_map.get_ranked_dependencies(
-                        focus_path, max_files=max_files * 2
+                # BFS import resolution
+                graph = self.resolver.get_dependency_graph(focus_path, max_depth=depth)
+                deps = graph.get(focus_path, [])
+                total_available += len(deps) + 1  # +1 for focus file
+
+                for dep_path in deps:
+                    if len(result.files) >= max_files:
+                        truncation_reason = "max_files"
+                        break
+                    if not _within_budget():
+                        truncation_reason = "token_budget"
+                        break
+                    self._add_file(
+                        result, dep_path, "import", coverage,
+                        skeletonize=skeletonize, focus_symbols=focus_symbols
                     )
-                    total_available += len(ranked_deps) + 1
-
-                    for dep_path, score in ranked_deps:
-                        if len(result.files) >= max_files:
-                            truncation_reason = "max_files"
-                            break
-                        if not _within_budget():
-                            truncation_reason = "token_budget"
-                            break
-                        self._add_file(
-                            result, dep_path, f"pagerank (score: {score:.4f})", coverage,
-                            score=score, skeletonize=skeletonize, focus_symbols=focus_symbols
-                        )
-                else:
-                    # Traditional BFS import resolution
-                    graph = self.resolver.get_dependency_graph(focus_path, max_depth=depth)
-                    deps = graph.get(focus_path, [])
-                    total_available += len(deps) + 1  # +1 for focus file
-
-                    for dep_path in deps:
-                        if len(result.files) >= max_files:
-                            truncation_reason = "max_files"
-                            break
-                        if not _within_budget():
-                            truncation_reason = "token_budget"
-                            break
-                        self._add_file(
-                            result, dep_path, "import", coverage,
-                            skeletonize=skeletonize, focus_symbols=focus_symbols
-                        )
 
         # 2. If query specified, do semantic search
         if query and result.total_tokens < (max_tokens or float("inf")):

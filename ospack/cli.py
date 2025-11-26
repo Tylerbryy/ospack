@@ -83,14 +83,14 @@ def main():
 @click.option("--quiet", "-Q", is_flag=True, help="Paths and scores only, no code content")
 @click.option("--verbose", "-v", is_flag=True, help="Include all metadata and debug info")
 @click.option(
-    "--pagerank", "-p", is_flag=True,
-    help="Use PageRank-based dependency ranking instead of simple BFS import traversal. "
-         "Identifies 'hub' symbols that are most referenced in the codebase."
-)
-@click.option(
     "--skeleton", "-S", is_flag=True,
     help="Skeletonize non-focus files: collapse function bodies to signatures only. "
          "Drastically reduces tokens while preserving class/function structure."
+)
+@click.option(
+    "--focus-only", "-F", is_flag=True,
+    help="Only use import resolution from --focus file, skip semantic search entirely. "
+         "Much faster for large repos - no index building required."
 )
 def pack(
     focus: str | None,
@@ -107,8 +107,8 @@ def pack(
     offset: int,
     quiet: bool,
     verbose: bool,
-    pagerank: bool,
     skeleton: bool,
+    focus_only: bool,
 ):
     """Pack relevant code context for AI assistants.
 
@@ -123,7 +123,6 @@ def pack(
     You can use both together: --focus finds dependencies, --query adds related code.
 
     ADVANCED OPTIONS:
-      --pagerank  - Use PageRank-based ranking to prioritize "hub" symbols
       --skeleton  - Collapse non-focus function bodies to save tokens
 
     OUTPUT FORMATS:
@@ -135,9 +134,20 @@ def pack(
       ospack pack --focus src/auth.py --import-depth 2
       ospack pack --query "database connection pooling" --max-files 5
       ospack pack --focus src/api.py --query "error handling" --format chunks
-      ospack pack --focus src/main.py --pagerank --skeleton  # Smart + compact
+      ospack pack --focus src/main.py --skeleton  # Compact output
     """
-    if not focus and not query:
+    # Handle --focus-only: ignore query, require focus
+    if focus_only:
+        if not focus:
+            err = ErrorResponse.create(
+                code=ErrorCode.MISSING_REQUIRED,
+                error="--focus-only requires --focus to be specified",
+                context={"missing": ["focus"]},
+            )
+            console.print(_format_error(err, format))
+            raise SystemExit(1)
+        query = None  # Ignore query when focus_only
+    elif not focus and not query:
         err = ErrorResponse.create(
             code=ErrorCode.MISSING_REQUIRED,
             error="Must specify --focus and/or --query",
@@ -174,7 +184,6 @@ def pack(
             hybrid=hybrid,
             chunk_mode=chunk_mode,
             offset=offset,
-            use_pagerank=pagerank,
             skeletonize=skeleton,
         )
 
@@ -304,32 +313,33 @@ def search(query: str, root: str, limit: int):
 def info(root: str):
     """Show ospack configuration and index status.
 
-    Displays the compute device (CPU/GPU), index location, and chunk count.
+    Displays the index location and chunk count.
     Use this to verify ospack is configured correctly and the index exists.
 
     USEFUL FOR:
-      - Checking if GPU acceleration is active
       - Finding where the index is stored
       - Verifying how many chunks are indexed
     """
-    from .embedder import get_device
     from .indexer import get_indexer
 
     root_path = Path(root).resolve()
 
+    from .indexer import _stemmer
+
     console.print("[bold]ospack info[/bold]")
     console.print(f"Root: {root_path}")
-    console.print(f"Device: {get_device()}")
+    stemmer_status = "enabled" if _stemmer else "disabled (install PyStemmer)"
+    console.print(f"Search: BM25+ with numba backend, stemming {stemmer_status}")
 
     indexer = get_indexer(str(root_path))
     console.print(f"Index path: {indexer.storage_dir}")
 
-    if indexer._table:
-        try:
-            count = len(indexer._table.to_pandas())
-            console.print(f"Indexed chunks: {count}")
-        except Exception:
-            console.print("Index not loaded")
+    indexer._load()
+    if indexer._doc_ids:
+        console.print(f"Indexed chunks: {len(indexer._doc_ids)}")
+        console.print(f"Indexed files: {len(indexer._file_mtimes)}")
+    else:
+        console.print("Index: not built (run 'ospack index' first)")
 
 
 # ============================================================================
@@ -600,7 +610,7 @@ def map(root: str, format: str, signatures: bool, max_sigs: int | None):
             max_sigs=max_sigs,
         )
 
-    console.print(output)
+    console.print(output, markup=False)
 
 
 @main.command()

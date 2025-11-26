@@ -22,7 +22,6 @@ from mcp.server.fastmcp import FastMCP
 from .indexer import get_indexer
 from .mapper import generate_repo_map
 from .packer import Packer, format_output
-from .resolver import get_repo_map
 
 mcp = FastMCP(
     "ospack",
@@ -43,6 +42,8 @@ def ospack_pack(
     max_files: int = 10,
     import_depth: int = 2,
     format: str = "compact",
+    focus_only: bool = False,
+    skeleton: bool = True,
 ) -> str:
     """Pack relevant code context for AI assistants.
 
@@ -73,6 +74,8 @@ def ospack_pack(
         max_files: Maximum files to include (default: 10)
         import_depth: Levels of imports to follow (default: 2)
         format: Output format - "compact" or "xml" (default: compact)
+        focus_only: Skip semantic search, only use import resolution (FAST for large repos)
+        skeleton: Collapse imported file bodies to signatures only (default: True, saves tokens)
 
     Returns:
         Packed code context as formatted string
@@ -81,20 +84,25 @@ def ospack_pack(
     if not root_path.exists():
         return f"Error: Root directory does not exist: {root}"
 
+    # Skip query when focus_only is set (avoids expensive index building)
+    effective_query = None if focus_only else query
+
     packer = Packer(str(root_path))
 
     result = packer.pack(
         focus=focus,
-        query=query,
+        query=effective_query,
         max_files=max_files,
         max_chunks=15,
         depth=import_depth,
         rerank=True,
         hybrid=True,
-        chunk_mode=True,  # Return chunks, not full files - lightweight
+        chunk_mode=not focus_only,  # Full files when focus_only, chunks otherwise
+        skeletonize=skeleton,  # Collapse non-focus function bodies to save tokens
     )
 
-    return format_output(result, format="chunks", root_dir=root_path)
+    output_format = format if focus_only else "chunks"
+    return format_output(result, format=output_format, root_dir=root_path)
 
 
 @mcp.tool()
@@ -383,123 +391,45 @@ def ospack_probe(
             "message": "No missing symbols detected. Context appears complete."
         }
 
-    # Try to find where missing symbols are defined using the repo map
-    repo_map = get_repo_map(str(root_path))
-    if not repo_map._built:
-        # Build quickly - this caches for future calls
-        repo_map.build()
-
     suggestions = []
-    found_symbols = []
 
-    for symbol in list(missing)[:limit]:
-        # Check if this symbol exists in the repo map
-        for symbol_key, file_path in repo_map._symbol_to_file.items():
-            if symbol_key.endswith(f":{symbol}"):
-                rel_path = str(file_path.relative_to(root_path))
-                found_symbols.append({
+    # Use semantic search (BM25 + dense) to find potential matches
+    indexer = get_indexer(str(root_path))
+    if indexer._table is not None or indexer.bm25_path.exists():
+        for symbol in list(missing)[:limit]:
+            results = indexer.search(f"{symbol} definition", limit=1, rerank=False, hybrid=True)
+            if results:
+                r = results[0]
+                file_path = Path(r["file_path"])
+                try:
+                    rel_path = str(file_path.relative_to(root_path))
+                except ValueError:
+                    rel_path = str(file_path)
+                suggestions.append({
                     "symbol": symbol,
                     "file": rel_path,
-                    "suggestion": f"ospack_pack(focus='{rel_path}') or ospack_search(query='{symbol}')"
+                    "name": r.get("name", ""),
+                    "suggestion": f"ospack_pack(focus='{rel_path}')"
                 })
-                break
-        else:
-            # Symbol not found in repo map, suggest search
+            else:
+                suggestions.append({
+                    "symbol": symbol,
+                    "suggestion": f"ospack_search(query='{symbol} definition')"
+                })
+    else:
+        # No index available, suggest search for all
+        for symbol in list(missing)[:limit]:
             suggestions.append({
                 "symbol": symbol,
                 "suggestion": f"ospack_search(query='{symbol} definition')"
             })
 
-    # Also do a quick semantic search to find potential matches
-    indexer = get_indexer(str(root_path))
-    if indexer._table is not None or indexer.bm25_path.exists():
-        for symbol in list(missing)[:5]:
-            if not any(f["symbol"] == symbol for f in found_symbols):
-                results = indexer.search(f"{symbol} definition", limit=1, rerank=False, hybrid=True)
-                if results:
-                    r = results[0]
-                    file_path = Path(r["file_path"])
-                    try:
-                        rel_path = str(file_path.relative_to(root_path))
-                    except ValueError:
-                        rel_path = str(file_path)
-                    suggestions.append({
-                        "symbol": symbol,
-                        "file": rel_path,
-                        "name": r.get("name", ""),
-                        "suggestion": f"ospack_pack(focus='{rel_path}')"
-                    })
-
     return {
         "missing_symbols": list(missing)[:limit],
-        "found_in_repo": found_symbols,
-        "search_suggestions": suggestions,
+        "suggestions": suggestions,
         "defined_symbols": list(defined)[:20],
         "message": f"Found {len(missing)} potentially missing symbols. Use the suggestions to fetch their definitions."
     }
-
-
-@mcp.tool()
-def ospack_pack_smart(
-    root: str,
-    focus: str | None = None,
-    query: str | None = None,
-    max_files: int = 10,
-    import_depth: int = 2,
-    format: str = "compact",
-    use_pagerank: bool = True,
-    skeletonize: bool = True,
-) -> str:
-    """Pack relevant code context using advanced features (PageRank + Skeletonization).
-
-    This is an enhanced version of ospack_pack that uses:
-    - PageRank-based dependency ranking: Instead of simple BFS import traversal,
-      analyzes the call graph to identify "hub" symbols that are most important
-    - Skeletonization: Collapses function bodies in non-focus files to just
-      signatures, drastically reducing token usage while preserving structure
-
-    WHEN TO USE:
-    - For large codebases where token budget is a concern
-    - When you want smarter dependency prioritization
-    - When you need to see the structure of many files without full implementations
-
-    WHEN NOT TO USE:
-    - For small, focused investigations (use regular ospack_pack)
-    - When you need full implementation details of all files
-
-    Args:
-        root: Repository root directory (required)
-        focus: Entry point file for import resolution (relative to root)
-        query: Natural language search query
-        max_files: Maximum files to include (default: 10)
-        import_depth: Levels of imports to follow (default: 2)
-        format: Output format - "compact" or "xml" (default: compact)
-        use_pagerank: Use PageRank for smarter dependency ranking (default: True)
-        skeletonize: Collapse non-focus function bodies (default: True)
-
-    Returns:
-        Packed code context with skeletonized dependencies
-    """
-    root_path = Path(root).resolve()
-    if not root_path.exists():
-        return f"Error: Root directory does not exist: {root}"
-
-    packer = Packer(str(root_path))
-
-    result = packer.pack(
-        focus=focus,
-        query=query,
-        max_files=max_files,
-        max_chunks=15,
-        depth=import_depth,
-        rerank=True,
-        hybrid=True,
-        chunk_mode=False,  # Return full files for skeletonization
-        use_pagerank=use_pagerank,
-        skeletonize=skeletonize,
-    )
-
-    return format_output(result, format=format, root_dir=root_path)
 
 
 def main():
