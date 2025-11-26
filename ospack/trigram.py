@@ -108,7 +108,9 @@ class TrigramIndex:
 
     def _get_conn(self) -> sqlite3.Connection:
         if not self._conn:
-            self._conn = sqlite3.connect(self.db_path)
+            # check_same_thread=False allows background watcher threads to use this connection
+            # WAL mode provides safe concurrent reads, and writes are serialized
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             # Enable WAL mode for concurrency and speed
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")

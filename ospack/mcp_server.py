@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import time
+from html import escape as html_escape
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -24,6 +25,13 @@ from .mapper import generate_repo_map
 from .packer import Packer, format_output, _estimate_tokens
 from .trigram import get_trigram_index
 from .workflows import get_workflows
+
+
+def _xml_escape(text: str) -> str:
+    """Escape text for safe XML inclusion."""
+    if not text:
+        return ""
+    return html_escape(str(text), quote=True)
 
 mcp = FastMCP(
     "ospack",
@@ -188,7 +196,7 @@ def ospack_search(
     query: str,
     limit: int = 10,
     min_score: float | None = None,
-) -> list[dict]:
+) -> str:
     """Search codebase semantically using natural language.
 
     Finds code chunks that match the conceptual meaning of your query, even if they
@@ -206,11 +214,6 @@ def ospack_search(
     - Need full context with imports (use ospack_pack)
     - Need exact pattern match with punctuation (use ospack_grep)
 
-    OUTPUT FORMAT:
-    Returns a list of dicts, each containing: file_path (relative), name (function/class
-    name if available), start_line, end_line, score (0-25 typical range, higher is better),
-    and content (truncated to 500 chars for overview).
-
     Args:
         root: Repository root directory. Must be absolute path.
         query: Natural language description of what you're looking for. Be specific -
@@ -221,12 +224,11 @@ def ospack_search(
             (no filtering). Set this when you're getting too many low-relevance results.
 
     Returns:
-        List of matches. Each match has: file_path, name, start_line, end_line, score, content.
-        Returns [{"error": "..."}] if root directory doesn't exist.
+        XML formatted search results with file paths, scores, and content previews.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return [{"error": f"Root directory does not exist: {root}"}]
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     indexer = get_indexer(str(root_path))
 
@@ -241,8 +243,9 @@ def ospack_search(
         hybrid=True,
     )
 
-    # Clean up results for MCP output
-    clean_results = []
+    # Build XML output
+    xml_parts = [f'<search_results query="{_xml_escape(query)}" count="{len(results)}">']
+
     for r in results:
         # Get the best available score
         score = r.get("rerank_score") or r.get("rrf_score") or r.get("score", 0)
@@ -258,16 +261,21 @@ def ospack_search(
         except ValueError:
             rel_path = str(file_path)
 
-        clean_results.append({
-            "file_path": rel_path,
-            "name": r.get("name", ""),
-            "start_line": r.get("start_line", 0),
-            "end_line": r.get("end_line", 0),
-            "score": round(score, 3),
-            "content": r.get("content", "")[:500],  # Truncate for overview
-        })
+        name = r.get("name", "")
+        name_attr = f' name="{_xml_escape(name)}"' if name else ""
 
-    return clean_results
+        xml_parts.append(
+            f'  <result file="{_xml_escape(rel_path)}" '
+            f'lines="{r.get("start_line", 0)}-{r.get("end_line", 0)}" '
+            f'score="{round(score, 3)}"{name_attr}>'
+        )
+        content = r.get("content", "")[:500]
+        if content:
+            xml_parts.append(f"    <preview>{_xml_escape(content)}</preview>")
+        xml_parts.append("  </result>")
+
+    xml_parts.append("</search_results>")
+    return "\n".join(xml_parts)
 
 
 @mcp.tool()
@@ -276,7 +284,7 @@ def ospack_grep(
     pattern: str,
     regex: bool = False,
     limit: int = 20,
-) -> list[dict]:
+) -> str:
     """Fast exact/regex code search using trigram index.
 
     Unlike ospack_search (semantic/BM25), this finds EXACT patterns including punctuation
@@ -303,10 +311,6 @@ def ospack_grep(
     - "def\\s+(get|set)_\\w+" - finds getter/setter methods
     - "TODO.*\\d{4}" - finds TODOs with year numbers
 
-    OUTPUT FORMAT:
-    Returns list of dicts with: file (relative path), line (1-indexed line number),
-    match (the matched text), context (2 lines before/after for context).
-
     Args:
         root: Repository root directory. Must be absolute path.
         pattern: Literal string or regex pattern to search. Must be at least 3 characters
@@ -316,12 +320,11 @@ def ospack_grep(
         limit: Maximum results to return (default: 20). Results are returned in file order.
 
     Returns:
-        List of matches. Each match has: file, line, match, context.
-        Returns [{"error": "..."}] if root directory doesn't exist.
+        XML formatted grep results with file paths, line numbers, matches, and context.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return [{"error": f"Root directory does not exist: {root}"}]
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     trigram_index = get_trigram_index(str(root_path))
 
@@ -335,8 +338,10 @@ def ospack_grep(
 
     results = trigram_index.search(pattern, regex=regex, limit=limit)
 
-    # Make paths relative
-    clean_results = []
+    # Build XML output
+    mode = "regex" if regex else "literal"
+    xml_parts = [f'<grep_results pattern="{_xml_escape(pattern)}" mode="{mode}" count="{len(results)}">']
+
     for r in results:
         file_path = Path(r["file"])
         try:
@@ -344,21 +349,23 @@ def ospack_grep(
         except ValueError:
             rel_path = str(file_path)
 
-        clean_results.append({
-            "file": rel_path,
-            "line": r["line"],
-            "match": r["match"],
-            "context": r["context"],
-        })
+        xml_parts.append(
+            f'  <match file="{_xml_escape(rel_path)}" line="{r["line"]}">'
+        )
+        xml_parts.append(f"    <text>{_xml_escape(r['match'])}</text>")
+        if r.get("context"):
+            xml_parts.append(f"    <context>{_xml_escape(r['context'])}</context>")
+        xml_parts.append("  </match>")
 
-    return clean_results
+    xml_parts.append("</grep_results>")
+    return "\n".join(xml_parts)
 
 
 @mcp.tool()
 def ospack_index(
     root: str,
     force: bool = False,
-) -> dict:
+) -> str:
     """Build or update the semantic search index for a repository.
 
     Creates a BM25+ keyword index of all code chunks to enable semantic search. Chunks are
@@ -384,22 +391,17 @@ def ospack_index(
     - Incremental updates: Usually <1 second (only processes changed files)
     - force=True rebuilds everything from scratch
 
-    OUTPUT FORMAT:
-    Returns dict with: chunks_indexed (number of code chunks), time_taken (seconds),
-    index_path (where index is stored), status ("rebuilt", "updated", or "up_to_date").
-
     Args:
         root: Repository root directory. Must be absolute path.
         force: Rebuild index from scratch, ignoring cached state (default: False).
             Use when index seems corrupted or after major branch switches.
 
     Returns:
-        Stats dict with chunks_indexed, time_taken, index_path, status.
-        Returns {"error": "..."} if root directory doesn't exist.
+        XML formatted index status with chunks_indexed, time_taken, index_path, status.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return {"error": f"Root directory does not exist: {root}"}
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     indexer = get_indexer(str(root_path))
 
@@ -407,12 +409,13 @@ def ospack_index(
     chunks_indexed = indexer.build_index(force=force)
     elapsed = time.time() - start_time
 
-    return {
-        "chunks_indexed": chunks_indexed,
-        "time_taken": round(elapsed, 2),
-        "index_path": str(indexer.storage_dir),
-        "status": "rebuilt" if force else ("updated" if chunks_indexed > 0 else "up_to_date"),
-    }
+    status = "rebuilt" if force else ("updated" if chunks_indexed > 0 else "up_to_date")
+
+    return f'''<index_result status="{status}">
+  <chunks_indexed>{chunks_indexed}</chunks_indexed>
+  <time_taken>{round(elapsed, 2)}</time_taken>
+  <index_path>{_xml_escape(str(indexer.storage_dir))}</index_path>
+</index_result>'''
 
 
 # Common built-in symbols to ignore when detecting missing symbols
@@ -490,7 +493,7 @@ def ospack_probe(
     root: str,
     content: str,
     limit: int = 10,
-) -> dict:
+) -> str:
     """Analyze packed context for missing symbols and suggest follow-up queries.
 
     This tool enables "Chain-of-Thought Retrieval" - instead of hoping one-shot retrieval
@@ -520,13 +523,6 @@ def ospack_probe(
     3. ospack_pack(query="User class definition") -> fetch missing pieces
     4. Repeat until ospack_probe returns no missing symbols
 
-    OUTPUT FORMAT:
-    Returns dict with:
-    - missing_symbols: List of symbol names that are referenced but not defined
-    - suggestions: List of dicts with {symbol, file (if found), suggestion (ospack command)}
-    - defined_symbols: List of symbols that ARE defined in the content (for reference)
-    - message: Human-readable summary
-
     Args:
         root: Repository root directory. Must be absolute path.
         content: The packed code content to analyze. Pass the full output from ospack_pack.
@@ -534,12 +530,11 @@ def ospack_probe(
             Higher values find more symbols but increase processing time.
 
     Returns:
-        Dict with missing_symbols, suggestions, defined_symbols, and message.
-        Returns {"error": "..."} if root directory doesn't exist.
+        XML formatted probe results with missing symbols, suggestions, and defined symbols.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return {"error": f"Root directory does not exist: {root}"}
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     # Extract symbols referenced and defined in the content
     referenced = _extract_symbols_from_content(content)
@@ -549,12 +544,16 @@ def ospack_probe(
     missing = referenced - defined - BUILTIN_SYMBOLS
 
     if not missing:
-        return {
-            "missing_symbols": [],
-            "suggestions": [],
-            "defined_symbols": list(defined)[:20],
-            "message": "No missing symbols detected. Context appears complete."
-        }
+        defined_list = list(defined)[:20]
+        xml_parts = ['<probe_result status="complete">']
+        xml_parts.append("  <message>No missing symbols detected. Context appears complete.</message>")
+        if defined_list:
+            xml_parts.append("  <defined_symbols>")
+            for sym in defined_list:
+                xml_parts.append(f"    <symbol>{_xml_escape(sym)}</symbol>")
+            xml_parts.append("  </defined_symbols>")
+        xml_parts.append("</probe_result>")
+        return "\n".join(xml_parts)
 
     suggestions = []
 
@@ -589,12 +588,33 @@ def ospack_probe(
                 "suggestion": f"ospack_search(query='{symbol} definition')"
             })
 
-    return {
-        "missing_symbols": list(missing)[:limit],
-        "suggestions": suggestions,
-        "defined_symbols": list(defined)[:20],
-        "message": f"Found {len(missing)} potentially missing symbols. Use the suggestions to fetch their definitions."
-    }
+    # Build XML output
+    xml_parts = [f'<probe_result status="incomplete" missing_count="{len(missing)}">']
+    xml_parts.append(f"  <message>Found {len(missing)} potentially missing symbols.</message>")
+
+    xml_parts.append("  <missing_symbols>")
+    for sym in list(missing)[:limit]:
+        xml_parts.append(f"    <symbol>{_xml_escape(sym)}</symbol>")
+    xml_parts.append("  </missing_symbols>")
+
+    xml_parts.append("  <suggestions>")
+    for s in suggestions:
+        file_attr = f' file="{_xml_escape(s.get("file", ""))}"' if s.get("file") else ""
+        name_attr = f' name="{_xml_escape(s.get("name", ""))}"' if s.get("name") else ""
+        xml_parts.append(f'    <suggestion symbol="{_xml_escape(s["symbol"])}"{file_attr}{name_attr}>')
+        xml_parts.append(f"      {_xml_escape(s['suggestion'])}")
+        xml_parts.append("    </suggestion>")
+    xml_parts.append("  </suggestions>")
+
+    defined_list = list(defined)[:20]
+    if defined_list:
+        xml_parts.append("  <defined_symbols>")
+        for sym in defined_list:
+            xml_parts.append(f"    <symbol>{_xml_escape(sym)}</symbol>")
+        xml_parts.append("  </defined_symbols>")
+
+    xml_parts.append("</probe_result>")
+    return "\n".join(xml_parts)
 
 
 @mcp.tool()
@@ -603,7 +623,7 @@ def ospack_impact(
     file: str,
     function: str | None = None,
     max_depth: int = 3,
-) -> dict:
+) -> str:
     """Find all files that would be affected by changes to a file/function.
 
     This is REVERSE dependency analysis - finds who USES this code, not what this code uses.
@@ -631,14 +651,6 @@ def ospack_impact(
     - directly_affected: Files that have an explicit import of the target file
     - transitively_affected: Files that import files that import the target (indirect deps)
 
-    OUTPUT FORMAT:
-    Returns dict with:
-    - target: The file being analyzed (relative path)
-    - function: The specific function being changed (if specified)
-    - directly_affected: List of file paths that directly import the target
-    - transitively_affected: List of file paths affected through dependency chain
-    - total_affected: Total count of all affected files
-
     Args:
         root: Repository root directory. Must be absolute path.
         file: Path to the file being changed, relative to root. Example: "src/auth/login.py"
@@ -648,12 +660,11 @@ def ospack_impact(
             1=direct importers only, 2=importers of importers, etc.
 
     Returns:
-        Dict with target, function, directly_affected, transitively_affected, total_affected.
-        Returns {"error": "..."} if root or file doesn't exist.
+        XML formatted impact analysis with target, directly_affected, transitively_affected files.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return {"error": f"Root directory does not exist: {root}"}
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     workflows = get_workflows(str(root_path))
 
@@ -665,7 +676,7 @@ def ospack_impact(
             fuzzy_matching=True,
         )
     except FileNotFoundError as e:
-        return {"error": str(e)}
+        return f'<error code="FILE_NOT_FOUND">{_xml_escape(str(e))}</error>'
 
     # Convert paths to relative strings for cleaner output
     def rel_path(p: Path) -> str:
@@ -674,13 +685,27 @@ def ospack_impact(
         except ValueError:
             return str(p)
 
-    return {
-        "target": rel_path(result.target),
-        "function": result.function,
-        "directly_affected": [rel_path(p) for p in result.directly_affected],
-        "transitively_affected": [rel_path(p) for p in result.transitively_affected],
-        "total_affected": result.total_affected,
-    }
+    target_path = rel_path(result.target)
+    func_attr = f' function="{_xml_escape(result.function)}"' if result.function else ""
+
+    xml_parts = [f'<impact_analysis target="{_xml_escape(target_path)}"{func_attr} total_affected="{result.total_affected}">']
+
+    # Directly affected files
+    direct = [rel_path(p) for p in result.directly_affected]
+    xml_parts.append(f'  <directly_affected count="{len(direct)}">')
+    for f in direct:
+        xml_parts.append(f'    <file>{_xml_escape(f)}</file>')
+    xml_parts.append("  </directly_affected>")
+
+    # Transitively affected files
+    transitive = [rel_path(p) for p in result.transitively_affected]
+    xml_parts.append(f'  <transitively_affected count="{len(transitive)}">')
+    for f in transitive:
+        xml_parts.append(f'    <file>{_xml_escape(f)}</file>')
+    xml_parts.append("  </transitively_affected>")
+
+    xml_parts.append("</impact_analysis>")
+    return "\n".join(xml_parts)
 
 
 @mcp.tool()
@@ -691,7 +716,7 @@ def ospack_audit(
     max_files: int = 10,
     import_depth: int = 2,
     skeleton: bool = False,
-) -> dict:
+) -> str:
     """Dry-run pack to check token costs BEFORE loading full content.
 
     Returns a detailed breakdown of what would be packed and how many tokens it would consume,
@@ -722,16 +747,6 @@ def ospack_audit(
     - 8,000-15,000 tokens: "Moderate size - consider skeleton mode"
     - >15,000 tokens: "Large result - reduce max_files or use skeleton mode"
 
-    OUTPUT FORMAT:
-    Returns dict with:
-    - total_tokens: Estimated total token count (~4 chars/token)
-    - total_files: Number of files that would be included
-    - total_lines: Total lines of code
-    - files: List of {file, tokens, lines, reason} sorted by tokens descending
-    - skeleton_mode: Whether skeleton mode was simulated
-    - recommendation: Human-readable suggestion based on token count
-    - truncated: Whether results were truncated due to limits
-
     Args:
         root: Repository root directory. Must be absolute path.
         focus: Entry point file for import resolution, relative to root.
@@ -742,15 +757,14 @@ def ospack_audit(
             Use True to see how much skeleton mode would save.
 
     Returns:
-        Dict with token breakdown, file list, and recommendation.
-        Returns {"error": "..."} if root doesn't exist or neither focus nor query specified.
+        XML formatted audit with token breakdown, file list, and recommendation.
     """
     root_path = Path(root).resolve()
     if not root_path.exists():
-        return {"error": f"Root directory does not exist: {root}"}
+        return f'<error code="INVALID_PATH">Root directory does not exist: {_xml_escape(root)}</error>'
 
     if not focus and not query:
-        return {"error": "Must specify focus and/or query"}
+        return '<error code="MISSING_REQUIRED">Must specify focus and/or query</error>'
 
     packer = Packer(str(root_path))
 
@@ -800,15 +814,22 @@ def ospack_audit(
     else:
         recommendation = f"Compact result ({total_tokens} tokens). Safe to pack."
 
-    return {
-        "total_tokens": total_tokens,
-        "total_files": len(result.files),
-        "total_lines": result.total_lines,
-        "files": file_breakdown,
-        "skeleton_mode": skeleton,
-        "recommendation": recommendation,
-        "truncated": result.truncation.truncated if result.truncation else False,
-    }
+    truncated = result.truncation.truncated if result.truncation else False
+
+    # Build XML output
+    xml_parts = [f'<audit_result total_tokens="{total_tokens}" total_files="{len(result.files)}" total_lines="{result.total_lines}" skeleton_mode="{str(skeleton).lower()}" truncated="{str(truncated).lower()}">']
+
+    xml_parts.append(f"  <recommendation>{_xml_escape(recommendation)}</recommendation>")
+
+    xml_parts.append(f'  <files count="{len(file_breakdown)}">')
+    for fb in file_breakdown:
+        xml_parts.append(
+            f'    <file path="{_xml_escape(fb["file"])}" tokens="{fb["tokens"]}" lines="{fb["lines"]}" reason="{_xml_escape(fb["reason"])}" />'
+        )
+    xml_parts.append("  </files>")
+
+    xml_parts.append("</audit_result>")
+    return "\n".join(xml_parts)
 
 
 def main():

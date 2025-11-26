@@ -10,6 +10,7 @@ dependencies = [
     "bm25s>=0.2",  # Fast BM25+ search (scipy-based)
     "numba>=0.60",  # ~2x faster retrieval via JIT compilation
     "PyStemmer>=2.0",  # Better recall via word stemming
+    "watchdog>=4.0",  # File system watching for auto-indexing
     "tree-sitter>=0.23.0",
     "tree-sitter-python>=0.23.0",
     "tree-sitter-javascript>=0.23.0",

@@ -396,11 +396,16 @@ class Indexer:
         if not self._bm25 or not self._doc_ids:
             self.build_index()
 
-        if not self._bm25:
+        if not self._bm25 or not self._doc_ids:
+            return []
+
+        # Ensure limit doesn't exceed corpus size
+        effective_limit = min(limit, len(self._doc_ids))
+        if effective_limit == 0:
             return []
 
         query_tokens = [code_tokenize(query)]
-        indices, scores = self._bm25.retrieve(query_tokens, k=limit)
+        indices, scores = self._bm25.retrieve(query_tokens, k=effective_limit)
 
         indices = indices[0]
         scores = scores[0]
@@ -427,10 +432,37 @@ class Indexer:
 # Global singleton
 _indexers: dict[str, Indexer] = {}
 
+# Auto-watch flag - can be disabled via environment variable
+AUTO_WATCH = os.environ.get("OSPACK_AUTO_WATCH", "1").lower() in ("1", "true", "yes")
 
-def get_indexer(root_dir: str) -> Indexer:
-    """Get or create an indexer for the given root directory."""
+
+def get_indexer(root_dir: str, auto_watch: bool | None = None) -> Indexer:
+    """Get or create an indexer for the given root directory.
+
+    Args:
+        root_dir: Repository root directory
+        auto_watch: If True, start file watcher for auto-indexing on changes.
+                    If None, uses OSPACK_AUTO_WATCH env var (default: True).
+                    Set to False to disable background watching.
+
+    Returns:
+        Indexer instance for the directory
+    """
     root_dir = str(Path(root_dir).resolve())
-    if root_dir not in _indexers:
+    is_new = root_dir not in _indexers
+
+    if is_new:
         _indexers[root_dir] = Indexer(root_dir)
-    return _indexers[root_dir]
+
+    indexer = _indexers[root_dir]
+
+    # Start watcher if enabled and this is a new indexer
+    should_watch = auto_watch if auto_watch is not None else AUTO_WATCH
+    if is_new and should_watch:
+        try:
+            from .watcher import start_watching
+            start_watching(root_dir, indexer)
+        except Exception as e:
+            logger.debug("Could not start file watcher: %s", e)
+
+    return indexer
