@@ -1,6 +1,6 @@
 [project]
 name = "ospack"
-version = "0.3.0"
+version = "0.4.0"
 description = "Semantic context packer for AI-assisted coding"
 readme = "README.md"
 requires-python = ">=3.10"

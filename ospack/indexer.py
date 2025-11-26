@@ -63,7 +63,7 @@ EXCLUDE_PATTERNS = [
 
 MAX_FILE_SIZE = int(os.environ.get("OSPACK_MAX_FILE_SIZE", 1024 * 1024))
 MAX_WORKERS = min(os.cpu_count() or 4, 8)
-SCHEMA_VERSION = 6  # v6: BM25+ with stemming, numba backend, mmap loading
+SCHEMA_VERSION = 7  # v7: Sub-tokenization for better recall (drag->draggable)
 
 
 def get_repo_hash(path: str) -> str:
@@ -112,47 +112,85 @@ def _chunk_file_worker(args: tuple[str, float]) -> tuple[list[dict], str | None,
         return ([], None, file_path)
 
 
-def code_tokenize(text: str, stem: bool = True) -> list[str]:
-    """Code-aware tokenizer for BM25 with optional stemming."""
-    text = text.lower()
-    raw_tokens = re.findall(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", text)
+# Common affixes to strip for sub-token generation
+# This helps "draggable" match "drag", "notification" match "notify", etc.
+_SUFFIXES = ("able", "ible", "tion", "sion", "ment", "ness", "ing", "ed", "er", "est", "ly", "ful", "less", "ize", "ise", "ify", "ous", "ive", "al", "ial", "ian")
+_PREFIXES = ("use", "get", "set", "is", "has", "can", "on", "pre", "post", "un", "re")
 
+
+def code_tokenize(text: str, stem: bool = True) -> list[str]:
+    """Code-aware tokenizer for BM25 with sub-tokenization for better recall.
+
+    Generates sub-tokens from compound words so that:
+    - "useDraggablePane" -> ["use", "draggable", "drag", "pane"]
+    - "notification" -> ["notification", "notif"]
+    - "useToast" -> ["use", "toast"]
+    """
     tokens = []
     seen = set()
 
-    for t in raw_tokens:
-        if t not in seen:
+    def add_token(t: str) -> None:
+        t = t.lower()
+        if t and len(t) > 1 and t not in seen:
             tokens.append(t)
             seen.add(t)
 
+    # Step 1: Split camelCase BEFORE lowercasing (critical for proper splitting)
+    # "useDraggablePane" -> ["use", "Draggable", "Pane"]
+    camel_split = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+", text)
+
+    # Step 2: Also extract raw alphanumeric tokens
+    raw_tokens = re.findall(r"[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)*", text)
+
+    # Add camelCase parts
+    for part in camel_split:
+        add_token(part)
+
+    # Add raw tokens and their snake_case / dot splits
+    for t in raw_tokens:
+        add_token(t)
+
+        # Split snake_case
         if "_" in t:
             for part in t.split("_"):
-                if part and part not in seen:
-                    tokens.append(part)
-                    seen.add(part)
+                add_token(part)
 
+        # Split dot notation (e.g., module.function)
         if "." in t:
             for part in t.split("."):
-                if part and part not in seen:
-                    tokens.append(part)
-                    seen.add(part)
+                add_token(part)
 
-        camel_parts = re.findall(r"[a-z]+|[0-9]+", t)
-        if len(camel_parts) > 1:
-            for part in camel_parts:
-                if part and part not in seen:
-                    tokens.append(part)
-                    seen.add(part)
+    # Step 3: Sub-tokenization - generate root forms by stripping affixes
+    # This dramatically improves recall for queries like "drag" matching "draggable"
+    subtokens = []
+    for t in list(tokens):  # Iterate over copy since we modify tokens
+        # Strip common suffixes
+        for suffix in _SUFFIXES:
+            if len(t) > len(suffix) + 2 and t.endswith(suffix):
+                root = t[:-len(suffix)]
+                if root not in seen and len(root) > 2:
+                    subtokens.append(root)
+                    seen.add(root)
+                break  # Only strip one suffix
 
+        # Strip common prefixes
+        for prefix in _PREFIXES:
+            if len(t) > len(prefix) + 2 and t.startswith(prefix):
+                remainder = t[len(prefix):]
+                if remainder not in seen and len(remainder) > 2:
+                    subtokens.append(remainder)
+                    seen.add(remainder)
+                break  # Only strip one prefix
+
+    tokens.extend(subtokens)
+
+    # Step 4: Apply stemming for additional recall (handles irregular forms)
     if stem and _stemmer is not None:
         stemmed = _stemmer.stemWords(tokens)
-        seen_stemmed = set()
-        unique_stemmed = []
         for s in stemmed:
-            if s not in seen_stemmed:
-                unique_stemmed.append(s)
-                seen_stemmed.add(s)
-        return unique_stemmed
+            if s not in seen and len(s) > 1:
+                tokens.append(s)
+                seen.add(s)
 
     return tokens
 
