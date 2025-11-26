@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from .indexer import get_indexer
 from .mapper import generate_repo_map
 from .packer import Packer, format_output, _estimate_tokens
+from .trigram import get_trigram_index
 from .workflows import get_workflows
 
 mcp = FastMCP(
@@ -29,8 +30,8 @@ mcp = FastMCP(
     instructions=(
         "Semantic code context packer for AI assistants. "
         "Use ospack_map for a birds-eye view of repo structure, ospack_pack to gather relevant code context, "
-        "ospack_search to find code by concept, ospack_index to build the search index, "
-        "ospack_probe to find missing symbols in packed context, "
+        "ospack_search to find code by concept, ospack_grep for exact/regex pattern search (preserves punctuation), "
+        "ospack_index to build the search index, ospack_probe to find missing symbols in packed context, "
         "ospack_impact to find files affected by changes (reverse dependency analysis), "
         "and ospack_audit to check token costs before packing (dry-run)."
     ),
@@ -213,6 +214,72 @@ def ospack_search(
             "end_line": r.get("end_line", 0),
             "score": round(r.get("rerank_score") or r.get("rrf_score") or r.get("score", 0), 3),
             "content": r.get("content", "")[:500],  # Truncate for overview
+        })
+
+    return clean_results
+
+
+@mcp.tool()
+def ospack_grep(
+    root: str,
+    pattern: str,
+    regex: bool = False,
+    limit: int = 20,
+) -> list[dict]:
+    """Fast exact/regex code search using trigram index.
+
+    Unlike ospack_search (semantic/BM25), this finds EXACT patterns
+    including punctuation. Uses trigram pre-filtering for speed.
+
+    WHEN TO USE:
+    - API calls: ".map(", "useState("
+    - Operators: "=>", "??"
+    - Regex patterns: r"async function \\w+"
+    - Exact strings with special characters
+
+    WHEN NOT TO USE:
+    - Fuzzy/conceptual search (use ospack_search)
+    - Finding code by meaning, not exact text
+
+    Args:
+        root: Repository root directory
+        pattern: Literal string or regex pattern to search
+        regex: If True, treat pattern as regex (default: False)
+        limit: Maximum results to return (default: 20)
+
+    Returns:
+        List of {file, line, match, context}
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return [{"error": f"Root directory does not exist: {root}"}]
+
+    trigram_index = get_trigram_index(str(root_path))
+
+    # Check if index is populated
+    stats = trigram_index.get_stats()
+    if stats["files"] == 0:
+        # Build index if empty
+        from .indexer import get_indexer
+        indexer = get_indexer(str(root_path))
+        indexer.build_index()
+
+    results = trigram_index.search(pattern, regex=regex, limit=limit)
+
+    # Make paths relative
+    clean_results = []
+    for r in results:
+        file_path = Path(r["file"])
+        try:
+            rel_path = str(file_path.relative_to(root_path))
+        except ValueError:
+            rel_path = str(file_path)
+
+        clean_results.append({
+            "file": rel_path,
+            "line": r["line"],
+            "match": r["match"],
+            "context": r["context"],
         })
 
     return clean_results

@@ -6,6 +6,7 @@ Features:
 - Memory-mapped loading for reduced RAM usage
 - PyStemmer for better recall (finds "running" when searching "run")
 - Code-aware tokenization (camelCase, snake_case splitting)
+- Trigram Index integration for exact/regex search
 """
 
 from __future__ import annotations
@@ -14,16 +15,17 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import bm25s
-import numpy as np
 from pathspec import PathSpec
 from pathspec.patterns import GitWildMatchPattern
 
 from .chunker import Chunker
 from .log import get_logger
+from .trigram import get_trigram_index
 
 logger = get_logger(__name__)
 
@@ -79,8 +81,12 @@ def is_text_file(path: Path, sample_size: int = 8192) -> bool:
         return False
 
 
-def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
-    """Worker function for parallel chunking."""
+def _chunk_file_worker(args: tuple[str, float]) -> tuple[list[dict], str | None, str]:
+    """Worker function for parallel chunking.
+
+    Returns:
+        Tuple of (chunks, file_content, file_path) - content is returned for trigram reuse
+    """
     global _worker_chunker
     file_path, mtime = args
     try:
@@ -91,7 +97,7 @@ def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
             _worker_chunker = Chunker()
         chunks = _worker_chunker.chunk(str(file_path), content)
 
-        return [{
+        chunk_dicts = [{
             "id": hashlib.md5(f"{file_path}:{c.start_line}-{c.end_line}".encode()).hexdigest(),
             "file_path": str(file_path),
             "content": c.content,
@@ -101,23 +107,13 @@ def _chunk_file_worker(args: tuple[str, float]) -> list[dict]:
             "node_type": c.node_type,
             "last_modified": mtime,
         } for c in chunks]
+        return (chunk_dicts, content, file_path)
     except Exception:
-        return []
+        return ([], None, file_path)
 
 
 def code_tokenize(text: str, stem: bool = True) -> list[str]:
-    """Code-aware tokenizer for BM25 with optional stemming.
-
-    Args:
-        text: The text to tokenize
-        stem: Whether to apply stemming (requires PyStemmer)
-
-    Features:
-        - Splits camelCase: getUserName -> [get, user, name]
-        - Splits snake_case: get_user_name -> [get, user, name]
-        - Splits dot notation: os.path.join -> [os, path, join]
-        - Stems words: running -> run, authentication -> authent
-    """
+    """Code-aware tokenizer for BM25 with optional stemming."""
     text = text.lower()
     raw_tokens = re.findall(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", text)
 
@@ -148,10 +144,8 @@ def code_tokenize(text: str, stem: bool = True) -> list[str]:
                     tokens.append(part)
                     seen.add(part)
 
-    # Apply stemming if available and requested
     if stem and _stemmer is not None:
         stemmed = _stemmer.stemWords(tokens)
-        # Dedupe after stemming (different words may stem to same root)
         seen_stemmed = set()
         unique_stemmed = []
         for s in stemmed:
@@ -172,8 +166,11 @@ class Indexer:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.version_path = self.storage_dir / "schema_version"
-        self.bm25_dir = self.storage_dir / "bm25s"  # bm25s uses a directory
+        self.bm25_dir = self.storage_dir / "bm25s"
         self.meta_path = self.storage_dir / "meta.json"
+
+        # Trigram index path (managed by TrigramIndex class, but we clear it on rebuild)
+        self.trigram_db_path = self.storage_dir / "trigram.db"
 
         self._bm25: bm25s.BM25 | None = None
         self._doc_ids: list[str] = []
@@ -214,7 +211,7 @@ class Indexer:
 
         if self.bm25_dir.exists() and self.meta_path.exists():
             try:
-                # Load bm25s model with memory-mapping (reduces RAM usage significantly)
+                # Load bm25s model with memory-mapping
                 self._bm25 = bm25s.BM25.load(str(self.bm25_dir), load_corpus=False, mmap=True)
 
                 # Load metadata
@@ -223,7 +220,7 @@ class Indexer:
                     self._doc_ids = meta["ids"]
                     self._doc_map = meta["map"]
                     self._file_mtimes = meta.get("mtimes", {})
-                logger.debug("Loaded BM25+ index (%d docs) with mmap.", len(self._doc_ids))
+                logger.debug("Loaded BM25+ index (%d docs).", len(self._doc_ids))
             except Exception as e:
                 logger.warning("Corrupt BM25+ index, will rebuild: %s", e)
 
@@ -242,7 +239,7 @@ class Indexer:
             }, f)
 
     def _check_schema_version(self) -> bool:
-        """Check if schema version matches. Returns True if rebuild needed."""
+        """Check if schema version matches."""
         if not self.version_path.exists():
             return True
         try:
@@ -263,11 +260,27 @@ class Indexer:
             force = True
 
         if force:
-            import shutil
             if self.bm25_dir.exists():
                 shutil.rmtree(self.bm25_dir)
             if self.meta_path.exists():
                 self.meta_path.unlink()
+
+            # Explicitly close and remove Trigram DB
+            from .trigram import _trigram_indexes
+            root_key = str(self.root_dir)
+            if root_key in _trigram_indexes:
+                _trigram_indexes[root_key].close()
+                del _trigram_indexes[root_key]
+
+            if self.trigram_db_path.exists():
+                try:
+                    self.trigram_db_path.unlink()
+                    # Clean up WAL/SHM files if they exist
+                    for p in self.storage_dir.glob("trigram.db*"):
+                        p.unlink()
+                except OSError as e:
+                    logger.warning(f"Could not remove trigram db: {e}")
+
             self._bm25 = None
             self._doc_ids = []
             self._doc_map = {}
@@ -296,49 +309,77 @@ class Indexer:
 
         logger.info("Indexing: +%d files, -%d files", len(to_add), len(to_remove))
 
-        # Remove old chunks
+        # 1. Update In-Memory Maps (BM25)
         if to_remove:
             self._doc_ids = [i for i in self._doc_ids if self._doc_map.get(i, {}).get("file_path") not in to_remove]
             self._doc_map = {k: v for k, v in self._doc_map.items() if v.get("file_path") not in to_remove}
             for path in to_remove:
                 self._file_mtimes.pop(path, None)
 
-        # Chunk new files
+        # 2. Chunking (Parallel)
         new_chunks: list[dict] = []
+        file_contents: dict[str, str] = {}  # Capture content for Trigram Index
+
         if to_add:
             logger.info("Chunking %d files...", len(to_add))
             with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker) as executor:
                 futures = [executor.submit(_chunk_file_worker, arg) for arg in to_add]
                 for future in as_completed(futures):
-                    new_chunks.extend(future.result())
+                    chunks, content, file_path = future.result()
+                    new_chunks.extend(chunks)
+                    if content is not None:
+                        file_contents[file_path] = content
 
             logger.info("Chunked -> %d chunks", len(new_chunks))
 
-            # Add to maps
             for chunk in new_chunks:
                 self._doc_ids.append(chunk["id"])
                 self._doc_map[chunk["id"]] = chunk
 
-            # Update mtimes
             for path, mtime in to_add:
                 self._file_mtimes[path] = mtime
 
-        # Rebuild BM25+ model
+        # 3. Rebuild BM25 Model
         if self._doc_ids:
-            logger.info("Building BM25+ index with numba backend...")
+            logger.info("Building BM25+ index...")
             corpus_tokens = []
             for doc_id in self._doc_ids:
                 doc = self._doc_map[doc_id]
                 text = f"{doc['name']} {doc['content']} {doc['file_path']}"
                 corpus_tokens.append(code_tokenize(text))
 
-            # Use BM25+ for better handling of varied document lengths
-            # Use numba backend for ~2x faster retrieval on large datasets
             self._bm25 = bm25s.BM25(method="bm25+", backend="numba")
             self._bm25.index(corpus_tokens)
 
         self._save()
         self._save_schema_version()
+
+        # 4. Update Trigram Index
+        # We process this AFTER BM25 success to ensure consistency
+        if to_remove or file_contents:
+            trigram_index = get_trigram_index(str(self.root_dir))
+
+            # Use bulk mode for large operations (drops B-Tree index during inserts)
+            is_bulk = len(file_contents) > 1000
+
+            if is_bulk:
+                trigram_index.begin_bulk_operation()
+
+            # Remove deleted/modified files
+            if to_remove:
+                for path in to_remove:
+                    trigram_index.remove(path)
+
+            # Add new/modified files
+            if file_contents:
+                logger.info("Updating trigram index (%d files)...", len(file_contents))
+                for path, content in file_contents.items():
+                    trigram_index.add(path, content)
+
+                trigram_index.commit()
+
+            if is_bulk:
+                trigram_index.end_bulk_operation()
 
         return len(new_chunks)
 
@@ -346,8 +387,8 @@ class Indexer:
         self,
         query: str,
         limit: int = 10,
-        rerank: bool = False,  # Ignored (no reranker)
-        hybrid: bool = False,  # Ignored (BM25+ only)
+        rerank: bool = False,
+        hybrid: bool = False,
     ) -> list[dict]:
         """BM25+ keyword search."""
         self._load()
@@ -358,11 +399,10 @@ class Indexer:
         if not self._bm25:
             return []
 
-        query_tokens = [code_tokenize(query)]  # bm25s expects list of token lists
+        query_tokens = [code_tokenize(query)]
         indices, scores = self._bm25.retrieve(query_tokens, k=limit)
 
-        # indices and scores are 2D arrays (queries x results)
-        indices = indices[0]  # First (only) query
+        indices = indices[0]
         scores = scores[0]
 
         results = []

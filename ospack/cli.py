@@ -309,6 +309,76 @@ def search(query: str, root: str, limit: int):
 
 
 @main.command()
+@click.argument("pattern")
+@click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
+@click.option("--regex", "-E", is_flag=True, help="Treat pattern as regular expression")
+@click.option("--limit", "-l", default=20, type=int, help="Maximum results to return (default: 20)")
+def grep(pattern: str, root: str, regex: bool, limit: int):
+    """Exact pattern search (preserves punctuation).
+
+    Unlike 'search' which uses BM25 tokenization (loses punctuation),
+    'grep' finds EXACT patterns including operators and special characters.
+    Uses trigram indexing for fast pre-filtering.
+
+    WHEN TO USE:
+      - API calls: ospack grep ".map("
+      - Operators: ospack grep "=>"
+      - Function calls: ospack grep "useState("
+      - Regex patterns: ospack grep -E "async function \\w+"
+
+    WHEN NOT TO USE:
+      - Fuzzy/conceptual search (use: ospack search)
+      - Finding code by meaning, not exact text
+
+    EXAMPLES:
+      ospack grep ".map(" --limit 10
+      ospack grep "useState(" --root /path/to/project
+      ospack grep -E "class\\s+\\w+Service"
+    """
+    from .trigram import get_trigram_index
+    from .indexer import get_indexer
+
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        console.print(f"[red]Error:[/red] Root directory not found: {root}")
+        raise SystemExit(1)
+
+    trigram_index = get_trigram_index(str(root_path))
+
+    # Check if index is populated
+    stats = trigram_index.get_stats()
+    if stats["files"] == 0:
+        console.print("[yellow]Trigram index empty, building...[/yellow]")
+        indexer = get_indexer(str(root_path))
+        indexer.build_index()
+
+    results = trigram_index.search(pattern, regex=regex, limit=limit)
+
+    if not results:
+        console.print("[yellow]No results found[/yellow]")
+        return
+
+    title = f"Grep results for: {pattern}" + (" (regex)" if regex else "")
+    table = Table(title=title)
+    table.add_column("File", style="cyan")
+    table.add_column("Line", style="green")
+    table.add_column("Match", style="yellow")
+
+    for r in results:
+        try:
+            rel_path = str(Path(r["file"]).relative_to(root_path))
+        except ValueError:
+            rel_path = r["file"]
+        table.add_row(
+            rel_path,
+            str(r["line"]),
+            r["match"][:60] + "..." if len(r["match"]) > 60 else r["match"],
+        )
+
+    console.print(table)
+
+
+@main.command()
 @click.option("--root", "-r", default=".", help="Repository root directory (absolute path recommended)")
 def info(root: str):
     """Show ospack configuration and index status.

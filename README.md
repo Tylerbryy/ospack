@@ -33,6 +33,7 @@ ospack pack --focus src/api.py --query "error handling"
 |---------|-------------|
 | `ospack pack` | Pack context from focus file and/or query |
 | `ospack search` | Quick BM25+ search |
+| `ospack grep` | Exact pattern search (preserves punctuation) |
 | `ospack map` | Generate repo structure map with signatures |
 | `ospack index` | Build/rebuild the search index |
 | `ospack info` | Show index status |
@@ -54,6 +55,12 @@ ospack pack --focus src/api.py --query "error handling"
 ```
 -m, --max-sigs N      Max signatures per file (default: unlimited)
 --no-signatures       Show only file tree, no code signatures
+```
+
+### grep
+```
+-E, --regex           Treat pattern as regular expression
+-l, --limit N         Max results to return (default: 20)
 ```
 
 ## Agent Integration
@@ -99,6 +106,7 @@ Or add to your MCP config:
 |------|-------------|
 | `ospack_pack` | Pack context with imports + BM25+ search |
 | `ospack_search` | BM25+ code search |
+| `ospack_grep` | Exact/regex pattern search (preserves punctuation) |
 | `ospack_map` | Generate repo structure map |
 | `ospack_index` | Build/rebuild search index |
 | `ospack_probe` | Detect missing symbols and suggest follow-up queries |
